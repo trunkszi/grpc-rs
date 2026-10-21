@@ -107,7 +107,7 @@ impl CompressionAlgorithm {
     ///
     /// # Errors
     /// Returns `ResourceExhausted` if output exceeds `max_size`, or
-    /// `InvalidArgument` if the compressed stream is malformed.
+    /// `Internal` if the compressed stream is malformed.
     pub fn decompress(self, input: &[u8], max_size: usize) -> Result<Vec<u8>, Status> {
         match self {
             Self::Identity => copy_bounded(input, max_size),
@@ -202,14 +202,14 @@ impl CompressionConfig {
     /// for both compressed and uncompressed messages.
     ///
     /// # Errors
-    /// Returns `InvalidArgument` if compressed bytes have no selected encoding
+    /// Returns `Internal` if compressed bytes have no selected encoding
     /// or are malformed, and `ResourceExhausted` if the decoded limit is exceeded.
     pub fn decompress(self, input: &[u8], compressed: bool) -> Result<Vec<u8>, Status> {
         if !compressed {
             return copy_bounded(input, self.max_decoding_message_size);
         }
         if self.algorithm == CompressionAlgorithm::Identity {
-            return Err(Status::invalid_argument(
+            return Err(Status::internal(
                 "compressed flag requires a non-identity encoding",
             ));
         }
@@ -383,7 +383,7 @@ fn too_large() -> Status {
 }
 
 fn malformed() -> Status {
-    Status::invalid_argument("malformed compressed message")
+    Status::internal("malformed compressed message")
 }
 
 #[cfg(test)]
@@ -486,12 +486,19 @@ mod unit_tests {
             .into_iter()
             .filter(|a| *a != CompressionAlgorithm::Identity)
         {
+            let config = CompressionConfig {
+                algorithm,
+                max_decoding_message_size: 1024,
+                ..CompressionConfig::default()
+            };
+            let corrupt = b"not a compressed stream";
             assert_eq!(
-                algorithm
-                    .decompress(b"not a compressed stream", 1024)
-                    .unwrap_err()
-                    .code(),
-                Code::InvalidArgument
+                algorithm.decompress(corrupt, 1024).unwrap_err().code(),
+                Code::Internal
+            );
+            assert_eq!(
+                config.decompress(corrupt, true).unwrap_err().code(),
+                Code::Internal
             );
         }
     }
@@ -504,9 +511,13 @@ mod unit_tests {
         {
             let encoded = algorithm.compress(&vec![b'x'; 1024]).unwrap();
             for length in 0..encoded.len() {
-                assert!(
-                    algorithm.decompress(&encoded[..length], 2048).is_err(),
-                    "{algorithm:?} accepted truncated stream of {length}/{} bytes",
+                assert_eq!(
+                    algorithm
+                        .decompress(&encoded[..length], 2048)
+                        .unwrap_err()
+                        .code(),
+                    Code::Internal,
+                    "{algorithm:?} truncated stream of {length}/{} bytes",
                     encoded.len()
                 );
             }
@@ -525,7 +536,7 @@ mod unit_tests {
                 trailing.extend_from_slice(suffix);
                 assert_eq!(
                     algorithm.decompress(&trailing, 1024).unwrap_err().code(),
-                    Code::InvalidArgument,
+                    Code::Internal,
                     "{algorithm:?} accepted trailing {suffix:?}"
                 );
             }
@@ -542,7 +553,7 @@ mod unit_tests {
             encoded.extend_from_slice(block);
             assert_eq!(
                 algorithm.decompress(&encoded, 64).unwrap_err().code(),
-                Code::InvalidArgument
+                Code::Internal
             );
             encoded.extend_from_slice(&following[7..]);
             assert_eq!(
@@ -580,7 +591,7 @@ mod unit_tests {
                     .decompress(&encoded[..length], payload.len())
                     .unwrap_err()
                     .code(),
-                Code::InvalidArgument
+                Code::Internal
             );
         }
         let first_block_size = u32::from_le_bytes(encoded[15..19].try_into().unwrap());
@@ -593,7 +604,7 @@ mod unit_tests {
                     .decompress(&corrupt, payload.len())
                     .unwrap_err()
                     .code(),
-                Code::InvalidArgument
+                Code::Internal
             );
         }
     }
@@ -611,7 +622,7 @@ mod unit_tests {
             encoded.pop();
             assert_eq!(
                 algorithm.decompress(&encoded, 11).unwrap_err().code(),
-                Code::InvalidArgument
+                Code::Internal
             );
         }
         for algorithm in [
@@ -623,7 +634,7 @@ mod unit_tests {
             encoded.extend(algorithm.compress(b"second").unwrap());
             assert_eq!(
                 algorithm.decompress(&encoded, 11).unwrap_err().code(),
-                Code::InvalidArgument
+                Code::Internal
             );
         }
     }
@@ -641,7 +652,7 @@ mod unit_tests {
         );
         assert_eq!(
             config.decompress(b"one", true).unwrap_err().code(),
-            Code::InvalidArgument
+            Code::Internal
         );
     }
 
