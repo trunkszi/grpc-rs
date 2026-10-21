@@ -1,5 +1,4 @@
 //! Synchronous streaming calls over a caller-thread I/O driver.
-//!
 //! Drivers handle transport, framing and codecs; handles enforce RPC lifecycle
 //! and cardinality without creating threads or an executor.
 use std::{cell::RefCell, fmt, rc::Rc};
@@ -95,10 +94,7 @@ impl<D: StreamDriver> State<D> {
         error
     }
     fn check(&self) -> Result<()> {
-        match &self.error {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
+        self.error.clone().map_or(Ok(()), Err)
     }
     fn accept<T>(&mut self, result: Result<T>) -> Result<T> {
         match result {
@@ -122,8 +118,10 @@ impl<D: StreamDriver> State<D> {
             }
             self.receive_closed = true;
             if self.client {
-                self.complete = true;
-                self.send_closed = true;
+                if !self.send_closed {
+                    self.driver.cancel();
+                }
+                (self.complete, self.send_closed) = (true, true);
             }
         }
         Ok(message)
@@ -153,9 +151,7 @@ impl<D: StreamDriver> State<D> {
         }
         let result = self.driver.finish(status, trailers);
         self.accept(result)?;
-        self.complete = true;
-        self.send_closed = true;
-        self.receive_closed = true;
+        (self.complete, self.send_closed, self.receive_closed) = (true, true, true);
         Ok(())
     }
     fn wait(&mut self) -> Result<()> {
@@ -250,12 +246,13 @@ impl<D: StreamDriver> Send<D::Send> for Handle<D> {
         self.with(|s| s.finish(status, trailers))
     }
 }
-fn shared<D: StreamDriver>(driver: D, client: bool) -> Rc<RefCell<State<D>>> {
+type Shared<D> = Rc<RefCell<State<D>>>;
+fn shared<D: StreamDriver>(driver: D, client: bool, send_closed: bool) -> Shared<D> {
     Rc::new(RefCell::new(State {
         driver,
         error: None,
         receive_closed: false,
-        send_closed: false,
+        send_closed,
         complete: false,
         client,
     }))
@@ -324,10 +321,10 @@ pub struct ServerStreamingCall<T> {
     receiver: Box<dyn Receive<T>>,
 }
 impl<T: 'static> ServerStreamingCall<T> {
-    /// Wraps an already-started call; the unary request has already been sent.
+    /// Wraps a call whose unary request was sent and half-closed by its driver.
     pub fn new<D: StreamDriver<Receive = T> + 'static>(driver: D) -> Self {
         Self {
-            receiver: Box::new(Handle(shared(driver, true))),
+            receiver: Box::new(Handle(shared(driver, true, true))),
         }
     }
     /// Performs one nonblocking receive attempt.
@@ -361,7 +358,7 @@ impl<Req: 'static> RequestStream<Req> {
     /// Wraps inbound requests without treating request EOF as response completion.
     pub fn new<D: StreamDriver<Receive = Req> + 'static>(driver: D) -> Self {
         Self(ServerStreamingCall {
-            receiver: Box::new(Handle(shared(driver, false))),
+            receiver: Box::new(Handle(shared(driver, false, false))),
         })
     }
 }
@@ -402,7 +399,7 @@ impl<T> ResponseSink<T> {
 pub fn server_streams<D: StreamDriver + 'static>(
     driver: D,
 ) -> (RequestStream<D::Receive>, ResponseSink<D::Send>) {
-    let state = shared(driver, false);
+    let state = shared(driver, false, false);
     (
         RequestStream(ServerStreamingCall {
             receiver: Box::new(Handle(Rc::clone(&state))),
@@ -419,7 +416,7 @@ pub struct BidiStreamingCall<Req, Resp> {
 }
 impl<Req: 'static, Resp: 'static> BidiStreamingCall<Req, Resp> {
     pub fn new<D: StreamDriver<Send = Req, Receive = Resp> + 'static>(driver: D) -> Self {
-        let state = shared(driver, true);
+        let state = shared(driver, true, false);
         Self {
             incoming: ServerStreamingCall {
                 receiver: Box::new(Handle(Rc::clone(&state))),
@@ -725,6 +722,11 @@ mod unit_lifecycle_scenario {
             log.borrow().ops.join(","),
             "send,recv,send,wait,send,close,close,recv,recv"
         );
+        let (driver, log) = Script::new(vec![Ok(None)]);
+        let mut call = BidiStreamingCall::new(driver);
+        assert_eq!(call.try_recv_next()?, None);
+        drop(call);
+        assert_eq!(log.borrow().ops, ["recv", "cancel"]);
         Ok(())
     }
     #[test]
