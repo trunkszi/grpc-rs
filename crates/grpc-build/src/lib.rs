@@ -2,9 +2,10 @@
 #![rustfmt::skip]
 //! Build-time lowering of service schemas into `#[grpc_service]` modules.
 //!
-//! `.proto` inputs are checked with `protoc`. `.fdl` inputs are compiled with
-//! Apache Fory `foryc`. `.capnp` inputs are compiled with `capnp`. Each schema
-//! also yields a Rust module of synchronous service traits.
+//! `.proto` inputs use `protoc` and, with the `protobuf` feature, `prost-build`.
+//! `.fdl` inputs use Apache Fory `foryc`. `.capnp` inputs use `capnp` and, with
+//! the `capnp` feature, `capnpc` Rust message generation. Each schema also yields
+//! synchronous service traits referencing message types in its enclosing module.
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -21,7 +22,8 @@ pub enum SchemaKind {
     Capnp,
 }
 /// Failure while reading a schema or running its compiler.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
 pub struct BuildError {
     message: String,
 }
@@ -30,18 +32,12 @@ impl BuildError {
         Self { message: message.into() }
     }
 }
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-impl std::error::Error for BuildError {}
 /// Rust service module plus the files emitted by the external compiler.
 #[derive(Debug)]
 pub struct CompiledSchema {
     /// Generated module of `#[grpc_service]` traits.
     pub service_rust: PathBuf,
-    /// Descriptor set, `foryc` sources, or Cap'n Proto binary.
+    /// Compiler outputs, including descriptors and feature-selected Rust messages.
     pub tool_output: Vec<PathBuf>,
 }
 /// Invokes `protoc`, `foryc`, and `capnp`, then writes service traits.
@@ -59,7 +55,7 @@ impl SchemaCompiler {
     pub fn new(out_dir: impl Into<PathBuf>) -> Self {
         Self {
             out_dir: out_dir.into(),
-            protoc: default_tool("/root/.local/bin/protoc", "protoc"),
+            protoc: std::env::var_os("PROTOC").map(PathBuf::from).unwrap_or_else(|| default_tool("/root/.local/bin/protoc", "protoc")),
             foryc: default_foryc(),
             capnp: default_tool("/usr/bin/capnp", "capnp"),
             includes: Vec::new(),
@@ -90,7 +86,7 @@ impl SchemaCompiler {
     /// # Errors
     ///
     /// Returns an error when the file cannot be read, the schema has no service,
-    /// or `protoc`, `foryc`, or `capnp` is missing or exits unsuccessfully.
+    /// or `protoc`, `foryc`, `capnp`, or a message generator fails.
     pub fn compile(&self, schema: &Path) -> Result<CompiledSchema, BuildError> {
         let kind = kind_of(schema)?;
         let source = fs::read_to_string(schema).map_err(|error| fail(&schema.display(), error))?;
@@ -119,7 +115,15 @@ impl SchemaCompiler {
         args.push("--include_imports".to_string());
         args.push(schema.display().to_string());
         run_command(&self.protoc, &args, None)?;
-        Ok(vec![descriptor])
+        #[cfg(feature = "protobuf")]
+        {
+            let mut config = prost_build::Config::new();
+            config.out_dir(&self.out_dir).protoc_executable(&self.protoc);
+            let mut includes = self.includes.clone();
+            if let Some(parent) = schema.parent() { includes.push(parent.to_path_buf()); }
+            config.compile_protos(&[schema], &includes).map_err(|error| fail(&schema.display(), error))?;
+        }
+        list_files(&self.out_dir)
     }
     fn invoke_foryc(&self, schema: &Path) -> Result<Vec<PathBuf>, BuildError> {
         let rust_out = self.out_dir.join("fory");
@@ -137,7 +141,15 @@ impl SchemaCompiler {
         args.push("-o-".to_string());
         args.push(schema.display().to_string());
         run_command(&self.capnp, &args, Some(&binary))?;
-        Ok(vec![binary])
+        #[cfg(feature = "capnp")]
+        {
+            let mut command = capnpc::CompilerCommand::new();
+            command.capnp_executable(&self.capnp).output_path(&self.out_dir).file(schema);
+            if let Some(parent) = schema.parent() { command.src_prefix(parent); }
+            for include in &self.includes { command.import_path(include); }
+            command.run().map_err(|error| BuildError::new(format!("capnp Rust code generation: {error}")))?;
+        }
+        list_files(&self.out_dir)
     }
 }
 /// Lowers schema text into `#[grpc_service]` modules without running a compiler.
@@ -447,20 +459,25 @@ fn skip_named_type(tokens: &[Tok], mut index: usize, package: &mut String, servi
 fn parse_capnp_method(tokens: &[Tok], mut index: usize) -> Result<(usize, MethodDef), BuildError> {
     let name = expect_ident(tokens, index, "capnp method")?;
     index = skip_annotations(tokens, skip_ordinal(tokens, index + 1))?;
-    let (client_streaming, request, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
+    let (mut client_streaming, request, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
         (false, "()".to_string(), index)
     } else {
         let (next, streaming, ty) = parse_capnp_side(tokens, index)?;
         (streaming, ty, next)
     };
     index = skip_annotations(tokens, next)?;
-    let (server_streaming, response, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
+    let (mut server_streaming, response, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
         let (next, streaming, ty) = parse_capnp_side(tokens, index + 2)?;
         (streaming, ty, next)
     } else {
         (false, "()".to_string(), index)
     };
-    index = skip_annotations(tokens, next)?;
+    index = next;
+    while symbol_is(tokens, index, '$') {
+        client_streaming |= ident_is(tokens, index + 1, "clientStreaming");
+        server_streaming |= ident_is(tokens, index + 1, "serverStreaming");
+        index = skip_annotation(tokens, index)?;
+    }
     if symbol_is(tokens, index, ';') { index += 1; }
     Ok((index, MethodDef { name, request, response, client_streaming, server_streaming }))
 }
@@ -551,7 +568,7 @@ fn render(services: &[ServiceDef]) -> Result<String, BuildError> {
         if used.iter().any(|name: &String| name == &module) { module = format!("{module}_{}", used.len()); }
         used.push(module.clone());
         out.push_str("#[allow(non_snake_case)]\n");
-        out.push_str(&format!("pub mod {module} {{\n"));
+        out.push_str(&format!("pub mod {module} {{\n    #[allow(unused_imports)]\n    use super::*;\n"));
         if service.package.is_empty() { out.push_str("    #[::grpc_macros::grpc_service]\n"); }
         else {
             let package = &service.package;
@@ -566,7 +583,7 @@ fn render(services: &[ServiceDef]) -> Result<String, BuildError> {
             out.push_str(cardinality_attr(method));
             let request = method.request.replace('.', "::");
             let response = method.response.replace('.', "::");
-            out.push_str(&format!("        fn {}({request}) -> {response};\n", method.name));
+            out.push_str(&format!("        fn {}(request: {request}) -> {response};\n", method.name));
         }
         out.push_str("    }\n}\n");
     }

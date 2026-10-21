@@ -4,7 +4,7 @@
 //! buffer, a Protobuf length delimiter, or a gRPC frame header. Decoding follows
 //! Protobuf rules, including acceptance of well-formed unknown fields.
 
-use std::{error::Error, fmt, marker::PhantomData};
+use std::marker::PhantomData;
 
 use grpc_core::codec::Codec;
 /// Serialization backend used by this adapter.
@@ -71,46 +71,20 @@ impl<E: Message, D: Message + Default> Codec for ProstCodec<E, D> {
 }
 
 /// A Protobuf serialization failure, preserving the backend error as its source.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProstCodecError {
     /// The outbound message could not be encoded into the destination.
-    Encode(prost::EncodeError),
+    #[error("Protobuf encoding failed: {0}")]
+    Encode(#[from] prost::EncodeError),
     /// The inbound payload is not a valid message of the requested type.
-    Decode(prost::DecodeError),
-}
-
-impl fmt::Display for ProstCodecError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Encode(error) => write!(formatter, "Protobuf encoding failed: {error}"),
-            Self::Decode(error) => write!(formatter, "Protobuf decoding failed: {error}"),
-        }
-    }
-}
-
-impl Error for ProstCodecError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Encode(error) => Some(error),
-            Self::Decode(error) => Some(error),
-        }
-    }
-}
-
-impl From<prost::EncodeError> for ProstCodecError {
-    fn from(error: prost::EncodeError) -> Self {
-        Self::Encode(error)
-    }
-}
-
-impl From<prost::DecodeError> for ProstCodecError {
-    fn from(error: prost::DecodeError) -> Self {
-        Self::Decode(error)
-    }
+    #[error("Protobuf decoding failed: {0}")]
+    Decode(#[from] prost::DecodeError),
 }
 
 #[cfg(test)]
 mod unit {
+    use std::error::Error;
+
     use super::*;
 
     #[test]

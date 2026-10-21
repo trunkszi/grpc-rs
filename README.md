@@ -156,6 +156,16 @@ stubs. `grpc-build::SchemaCompiler` invokes `protoc`, `foryc` or `capnp` and emi
 Rust service definitions. Configure `protoc_path`, `foryc_path`, `capnp_path` and
 `include` for the installed tools and schema imports. Compiler-generated message
 types and generated service modules are separate outputs; retain both as needed.
+The default `grpc-build` features generate Prost and Cap'n Proto Rust messages;
+use `default-features = false` for a Fory-only build dependency. `PROTOC` and
+`FORYC` select compiler executables, with explicit builder paths taking priority.
+
+The checked-in `proto/hft_order.{proto,fdl,capnp}` schemas define integer-lot,
+integer-tick orders, acknowledgements, depth and fill messages. The facade's
+`build.rs` compiles only schemas selected by codec features into `OUT_DIR`.
+Cap'n Proto's `$clientStreaming` and `$serverStreaming` method annotations
+select gRPC cardinality; its native capability RPC bindings are not used as the
+gRPC transport.
 
 ## Cap'n Proto and alignment
 
@@ -374,15 +384,17 @@ cargo test -p grpc --all-features --test hft_e2e_parity
 cargo bench -p grpc --all-features --bench hft_rpc_bench
 ```
 
-The example uses loopback TCP and generated service adapters. The E2E target covers
+The example uses loopback TCP, IDL-generated structured messages and generated
+service adapters. All four RPC shapes run with each codec and Zstd. The E2E target covers
 RPC results across method shapes, codecs, compression and transports. Local
 client/server E2E tests exercise this implementation on both endpoints; they do
 not establish interoperability with an independent gRPC implementation.
 
-Benchmarks report codec/framing, compression and complete RPC exchange costs.
-RPC samples reuse established connections and exclude connection setup/teardown.
-`GRPC_BENCH_ITERATIONS` selects 1–1,000,000 samples per workload (default 32);
-results include p50/p99 latency in nanoseconds and throughput in operations/second.
+The benchmark measures batches of all four RPC shapes using the same generated
+messages as the example. Samples reuse established TCP connections, exclude
+connection setup/teardown and run after one warmup batch per codec.
+`GRPC_BENCH_ITERATIONS` selects 1–1,000,000 batches per codec (default 32);
+results include p50/p99 batch latency in nanoseconds and throughput in batches/second.
 Interpret results with the workload, payload size, transport and build profile; the framework's synchronous design does not imply
 an allocation-free path or a fixed latency bound.
 

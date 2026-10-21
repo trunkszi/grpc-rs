@@ -4,7 +4,7 @@
 //! Repeated entries retain insertion order. This owned collection allocates on
 //! insertion; it makes no allocation guarantees for RPC hot paths.
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use base64::{
     Engine as _, alphabet,
@@ -23,36 +23,27 @@ pub enum MetadataValue {
 }
 
 /// Invalid application metadata rejected before insertion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MetadataError {
     /// A key is empty or contains a character outside `[a-z0-9_.-]`.
+    #[error("metadata keys must be nonempty lowercase ASCII tokens")]
     InvalidKey,
     /// A key uses the protocol-reserved `grpc-` prefix.
+    #[error("the grpc- metadata prefix is reserved for the protocol")]
     ReservedKey,
     /// A binary key was paired with ASCII data, or the reverse.
+    #[error("binary metadata requires a -bin key and raw bytes")]
     ValueKindMismatch,
     /// An ASCII value violates its incoming or outgoing character policy.
+    #[error("metadata values contain invalid ASCII characters")]
     InvalidAsciiValue,
     /// A binary header contains malformed Base64.
+    #[error("binary metadata must contain valid standard Base64")]
     InvalidBinaryValue,
     /// A timeout is malformed or cannot fit the eight-digit wire representation.
+    #[error("grpc-timeout requires up to eight digits and a supported unit")]
     InvalidTimeout,
 }
-
-impl fmt::Display for MetadataError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidKey => "metadata keys must be nonempty lowercase ASCII tokens",
-            Self::ReservedKey => "the grpc- metadata prefix is reserved for the protocol",
-            Self::ValueKindMismatch => "binary metadata requires a -bin key and raw bytes",
-            Self::InvalidAsciiValue => "metadata values contain invalid ASCII characters",
-            Self::InvalidBinaryValue => "binary metadata must contain valid standard Base64",
-            Self::InvalidTimeout => "grpc-timeout requires up to eight digits and a supported unit",
-        })
-    }
-}
-
-impl std::error::Error for MetadataError {}
 
 /// Application metadata preserving repeated keys and insertion order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

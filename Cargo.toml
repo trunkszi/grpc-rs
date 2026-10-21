@@ -18,6 +18,14 @@ publish = false
 repository = "https://github.com/trunkszi/grpc-rs"
 
 [workspace.dependencies]
+thiserror = { version = "2.0" }
+anyhow = { version = "1.0" }
+prost-build = { version = "0.14" }
+capnpc = { version = "0.25" }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = { version = "1" }
+proc-macro2 = { version = "1" }
+grpc-build = { path = "crates/grpc-build", default-features = false }
 zstd = { version = "0.13" }
 lz4_flex = { version = "0.11" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

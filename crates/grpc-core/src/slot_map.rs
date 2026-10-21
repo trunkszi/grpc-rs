@@ -4,7 +4,6 @@
 //! Normalized buffers and shrinking queues bound spare capacity. Rejections preserve accepted data.
 use std::{
     collections::{BTreeMap, VecDeque},
-    fmt,
     mem::size_of,
 };
 
@@ -38,74 +37,49 @@ impl Default for StreamLimits {
 }
 
 /// A rejected stream operation. Rejection never consumes an input prefix.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SlotMapError {
     /// HTTP/2 stream identifiers must be positive signed 31-bit integers.
+    #[error("invalid stream identifier {0}")]
     InvalidStreamId(i32),
     /// The identifier already has a slot.
+    #[error("stream {0} is already open")]
     AlreadyOpen(i32),
     /// The identifier has no slot.
+    #[error("unknown stream {0}")]
     UnknownStream(i32),
     /// The peer's GOAWAY prohibits this stream.
+    #[error("GOAWAY: stream={stream_id}, last={last_stream_id}, code={error_code}")]
     GoAway {
         stream_id: i32,
         last_stream_id: i32,
         error_code: u32,
     },
     /// An error or incomplete-response reset prevents reads of buffered events.
+    #[error("stream {stream_id} reset: code={error_code}")]
     Reset { stream_id: i32, error_code: u32 },
     /// The event violates the receive or half-close lifecycle.
+    #[error("stream {stream_id}: cannot {operation}")]
     InvalidTransition {
         stream_id: i32,
         operation: &'static str,
     },
     /// The stream would exceed its retained byte budget.
+    #[error("stream {stream_id}: byte limit {limit}")]
     MemoryLimit { stream_id: i32, limit: usize },
     /// The stream would exceed its queued message count.
+    #[error("stream {stream_id}: message limit {limit}")]
     MessageLimit { stream_id: i32, limit: usize },
     /// A gRPC envelope compression flag was neither zero nor one.
+    #[error("stream {stream_id}: invalid compression flag {flag}")]
     InvalidCompressionFlag { stream_id: i32, flag: u8 },
     /// Trailers or END_STREAM arrived in an incomplete envelope.
+    #[error("stream {0}: truncated envelope")]
     TruncatedFrame(i32),
     /// Both halves must close, or a reset must arrive, before removal.
+    #[error("stream {0} is not closed")]
     NotClosed(i32),
 }
-impl fmt::Display for SlotMapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidStreamId(id) => write!(f, "invalid stream identifier {id}"),
-            Self::AlreadyOpen(id) => write!(f, "stream {id} is already open"),
-            Self::UnknownStream(id) => write!(f, "unknown stream {id}"),
-            Self::GoAway {
-                stream_id: id,
-                last_stream_id: last,
-                error_code: code,
-            } => write!(f, "GOAWAY: stream={id}, last={last}, code={code}"),
-            Self::Reset {
-                stream_id,
-                error_code,
-            } => write!(f, "stream {stream_id} reset: code={error_code}"),
-            Self::InvalidTransition {
-                stream_id,
-                operation,
-            } => write!(f, "stream {stream_id}: cannot {operation}"),
-            Self::MemoryLimit {
-                stream_id: id,
-                limit,
-            } => write!(f, "stream {id}: byte limit {limit}"),
-            Self::MessageLimit {
-                stream_id: id,
-                limit,
-            } => write!(f, "stream {id}: message limit {limit}"),
-            Self::InvalidCompressionFlag { stream_id, flag } => {
-                write!(f, "stream {stream_id}: invalid compression flag {flag}")
-            }
-            Self::TruncatedFrame(id) => write!(f, "stream {id}: truncated envelope"),
-            Self::NotClosed(id) => write!(f, "stream {id} is not closed"),
-        }
-    }
-}
-impl std::error::Error for SlotMapError {}
 /// Result of admitting, consuming or transitioning a stream event.
 pub type SlotResult<T> = Result<T, SlotMapError>;
 fn memory_limit(stream_id: i32, limits: StreamLimits) -> SlotMapError {

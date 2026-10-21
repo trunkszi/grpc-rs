@@ -1,7 +1,5 @@
 //! Canonical gRPC status codes and their HTTP/2 trailer representation.
 
-use std::fmt;
-
 /// The seventeen canonical gRPC status codes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(i32)]
@@ -73,7 +71,8 @@ impl Code {
 }
 
 /// A gRPC outcome containing a canonical code and a UTF-8 diagnostic message.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{code:?}: {message}")]
 pub struct Status {
     code: Code,
     message: String,
@@ -144,14 +143,6 @@ impl Status {
         encode_grpc_message(&self.message)
     }
 }
-
-impl fmt::Display for Status {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for Status {}
 
 /// Percent-encodes UTF-8 bytes, leaving only RFC 3986 unreserved bytes literal.
 #[must_use]
