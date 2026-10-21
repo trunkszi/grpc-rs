@@ -119,3 +119,31 @@ fn unit_early_ok_peer_reset_and_local_upload_close_are_idempotent() -> Result<()
     client.remove_closed_stream(id)?;
     Ok(())
 }
+
+#[test]
+fn unit_reaping_preserves_dispatched_terminal_failure() -> Result<(), Status> {
+    let mut client = GrpcClientSession::new(SessionConfig::default())?;
+    let mut server = GrpcServerSession::new(SessionConfig::default())?;
+    let id = client.start_request(
+        "localhost",
+        "/limits.Check/Call",
+        &Metadata::new(),
+        None,
+        CompressionAlgorithm::Identity,
+        false,
+    )?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(
+        server
+            .pop_incoming_request()
+            .expect("request ownership")
+            .stream_id,
+        id
+    );
+    client.cancel_stream(id, 8)?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(server.reap_closed_undispatched_streams()?, 0);
+    assert_eq!(server.pop_message(id).unwrap_err().code(), Code::Cancelled);
+    server.remove_closed_stream(id)?;
+    Ok(())
+}

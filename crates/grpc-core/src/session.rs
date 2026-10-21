@@ -2,6 +2,7 @@
 //!
 //! Receive budgets cover metadata, message descriptors and reserved partial envelopes.
 //! Native HTTP/2 storage, temporary copies and queued IncomingRequest metadata are separate.
+mod ownership;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
@@ -113,7 +114,7 @@ struct Stream {
     outgoing_encoding: CompressionAlgorithm,
     outgoing: Rc<RefCell<Outbound>>,
     headers: Headers, header_bytes: usize,
-    initial: bool, sent_initial: bool, terminal: bool, closed: bool, end_stream_serialized: bool,
+    initial: bool, sent_initial: bool, terminal: bool, closed: bool, end_stream_serialized: bool, dispatched: bool,
     failure: Option<Status>, failure_taken: bool, http_status: u16,
     pending_trailers: Option<Vec<(String, String)>>,
     prefix: Vec<u8>, remaining: usize, reserved: usize,
@@ -273,7 +274,7 @@ impl GrpcClientSession {
 #[rustfmt::skip]
 impl GrpcServerSession {
     /// Transfers the next received request's routing information.
-    pub fn pop_incoming_request(&mut self) -> Option<IncomingRequest> { self.incoming.pop_front() }
+    pub fn pop_incoming_request(&mut self) -> Option<IncomingRequest> { let request = self.incoming.pop_front()?; if let Some(stream) = self.streams.get_mut(&request.stream_id) { stream.dispatched = true; } Some(request) }
     /// Sends response headers and installs an incremental body source.
     /// # Errors
     /// Rejects duplicate headers, ended streams and native submission failure.
@@ -308,7 +309,7 @@ impl GrpcServerSession {
             drop(queue);
             self.resume(id)?;
         }
-        self.slots.mark_local_end_stream(id).map_err(slot_error)
+        self.stream_mut(id)?.dispatched = true; self.slots.mark_local_end_stream(id).map_err(slot_error)
     }
 }
 #[rustfmt::skip]
@@ -327,7 +328,7 @@ impl<Role> GrpcSession<Role> {
         let queue = Rc::clone(&self.stream_mut(id)?.outgoing);
         native!(self, submit_response(id, &fields(&headers), Some(DataProvider::new(Source { queue, chunk: Vec::new() })))).map_err(internal)?;
         let stream = self.stream_mut(id)?;
-        stream.sent_initial = true;
+        stream.sent_initial = true; stream.dispatched = true;
         stream.outgoing_encoding = encoding;
         Ok(())
     }
@@ -375,7 +376,7 @@ impl<Role> GrpcSession<Role> {
                 encoding: CompressionAlgorithm::Identity,
                 outgoing_encoding: encoding,
                 outgoing: queue,
-                headers: vec![], header_bytes: 0, initial: false, sent_initial: false, terminal: false, closed: false, end_stream_serialized: false,
+                headers: vec![], header_bytes: 0, initial: false, sent_initial: false, terminal: false, closed: false, end_stream_serialized: false, dispatched: false,
                 failure: None, failure_taken: false, http_status: 200, pending_trailers: None,
                 prefix: vec![], remaining: 0, reserved: 0,
             },

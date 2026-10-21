@@ -65,24 +65,25 @@ impl<T: SyncTransport> ServerInner<T> {
             }
         };
         if blocking && matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
-            let mut timeout = remaining(deadline)?;
-            if self.session.want_write() {
-                let quantum = Duration::from_millis(1);
-                timeout = Some(timeout.map_or(quantum, |left| left.min(quantum)));
-            }
-            self.transport
-                .set_read_timeout(timeout)
-                .map_err(io_status)?;
             self.transport.set_nonblocking(false).map_err(io_status)?;
-            result = loop {
-                match self.transport.read(&mut self.buffer) {
-                    Err(error)
-                        if error.kind() == io::ErrorKind::Interrupted
-                            && deadline.is_none_or(|at| Instant::now() < at) => {}
-                    result => break result,
+            let waited = (|| -> Result<_, Status> {
+                loop {
+                    let mut timeout = remaining(deadline)?;
+                    if self.session.want_write() || !self.pending_reap.is_empty() {
+                        let quantum = Duration::from_millis(1);
+                        timeout = Some(timeout.map_or(quantum, |left| left.min(quantum)));
+                    }
+                    self.transport
+                        .set_read_timeout(timeout)
+                        .map_err(io_status)?;
+                    match self.transport.read(&mut self.buffer) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        result => return Ok(result),
+                    }
                 }
-            };
+            })();
             self.transport.set_nonblocking(true).map_err(io_status)?;
+            result = waited?;
         }
         let count = match result {
             Ok(0) => {
@@ -123,6 +124,7 @@ impl<T: SyncTransport> ServerInner<T> {
     fn flush(&mut self) -> Result<(), Status> {
         self.transport.set_nonblocking(true).map_err(io_status)?;
         self.session.flush_to_transport(&mut self.transport)?;
+        self.session.reap_closed_undispatched_streams()?;
         let ready: Vec<_> = self
             .pending_reap
             .iter()
