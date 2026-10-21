@@ -18,6 +18,11 @@ publish = false
 repository = "https://github.com/trunkszi/grpc-rs"
 
 [workspace.dependencies]
+zstd = { version = "0.13" }
+lz4_flex = { version = "0.11" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+snap = { version = "1" }
+base64 = { version = "0.22" }
 grpc-core = { path = "crates/grpc-core" }
 grpc-codec-prost = { path = "crates/grpc-codec/prost" }
 grpc-codec-fory = { path = "crates/grpc-codec/fory" }
