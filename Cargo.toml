@@ -30,6 +30,8 @@ grpc-codec-capnp = { path = "crates/grpc-codec/capnp" }
 grpc-macros = { path = "crates/grpc-macros" }
 nghttp2 = { git = "https://github.com/trunkszi/nghttp2-rs.git", branch = "main" }
 socket2 = { version = "0.6", features = ["all"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
 fory = { git = "https://github.com/apache/fory.git", branch = "main" }
 prost = { version = "0.14", default-features = false, features = ["std"] }
 capnp = { version = "0.25", default-features = false, features = ["std", "alloc"] }
