@@ -174,19 +174,13 @@ fn integration_scenario_trailers_only_and_remote_error() -> Result<(), Status> {
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_scenario_stream_limits_and_outbound_lifecycle() -> Result<(), Status> {
     let mut client = GrpcClientSession::new(SessionConfig {
         max_active_streams: 1,
         ..SessionConfig::default()
     })?;
-    let id = client.start_request(
-        "localhost",
-        "/example.Echo/Call",
-        &Metadata::new(),
-        None,
-        Encoding::Identity,
-        false,
-    )?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, false)?;
     assert_eq!(
         client
             .start_request(
@@ -329,6 +323,7 @@ fn integration_scenario_cancel_does_not_corrupt_other_streams() -> Result<(), St
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_scenario_outbound_budget_rejection_preserves_accepted_body() -> Result<(), Status> {
     let config = SessionConfig {
         per_stream_byte_budget: 2048,
@@ -337,14 +332,7 @@ fn integration_scenario_outbound_budget_rejection_preserves_accepted_body() -> R
     };
     let mut client = GrpcClientSession::new(config)?;
     let mut server = GrpcServerSession::new(SessionConfig::default())?;
-    let id = client.start_request(
-        "localhost",
-        "/example.Echo/Call",
-        &Metadata::new(),
-        None,
-        Encoding::Identity,
-        false,
-    )?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, false)?;
     client.send_message(id, b"accepted", Encoding::Identity)?;
     assert_eq!(
         client
@@ -663,17 +651,11 @@ fn integration_scenario_decompression_limit_isolated_from_other_streams() -> Res
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_scenario_negotiated_encoding_mismatch_rejects_without_losing_prefix()
 -> Result<(), Status> {
     let (mut client, mut server) = pair()?;
-    let id = client.start_request(
-        "localhost",
-        "/example.Echo/Call",
-        &Metadata::new(),
-        None,
-        Encoding::Zstd,
-        false,
-    )?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Zstd, false)?;
     client.send_message(id, b"accepted", Encoding::Zstd)?;
     assert_eq!(
         client
@@ -784,16 +766,25 @@ fn integration_scenario_message_count_limit_is_resource_exhausted() -> Result<()
 #[test]
 #[rustfmt::skip]
 fn integration_scenario_codec_content_types_are_advertised_and_received() -> Result<(), Status> {
+    let (mut client, mut server) = pair()?;
     for content_type in ["application/grpc+proto", "application/grpc+fory", "application/grpc+capnp"] {
-        let config = SessionConfig { content_type: content_type.into(), ..SessionConfig::default() };
-        let mut client = GrpcClientSession::new(config.clone())?;
-        let mut server = GrpcServerSession::new(config)?;
-        let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true)?;
+        let id = client.start_request_with_content_type("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true, content_type)?;
         exchange(&mut client, &mut server)?;
         assert_eq!(server.pop_incoming_request().expect("typed request").content_type, content_type);
+        for invalid in ["text/html", "application/grpcx", "application/grpc+", "application/grpc+proto\r\nx: y"] {
+            assert_eq!(client.start_request_with_content_type("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true, invalid).unwrap_err().code(), Code::InvalidArgument);
+            assert_eq!(server.send_initial_metadata_with_content_type(id, &Metadata::new(), Encoding::Identity, invalid).unwrap_err().code(), Code::InvalidArgument);
+        }
+        server.send_initial_metadata_with_content_type(id, &Metadata::new(), Encoding::Identity, content_type)?;
+        server.send_message(id, b"codec body", Encoding::Identity)?;
         server.finish_response(id, &Status::new(Code::Ok, ""), &Metadata::new())?;
         exchange(&mut client, &mut server)?;
+        assert_eq!(client.pop_message(id)?.expect("typed response").payload(), b"codec body");
         assert_eq!(client.take_trailers(id)?.expect("typed response").0.code(), Code::Ok);
     }
+    let id = client.start_request("localhost", "/example.Echo/Default", &Metadata::new(), None, Encoding::Identity, true)?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(server.pop_incoming_request().expect("default request").content_type, "application/grpc");
+    server.send_initial_metadata(id, &Metadata::new(), Encoding::Identity)?;
     Ok(())
 }
