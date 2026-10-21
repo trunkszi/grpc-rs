@@ -141,6 +141,8 @@ all types, then transfer it with `ForyCodec::with_fory`. Add the adapter crate
 as a direct dependency when using its backend exports. Registration IDs, schemas
 and cross-language settings must match the peer; registration freezes on first use.
 Keep backend validation and resource limits enabled for untrusted messages.
+Custom serializers must not recursively invoke backend serialization or
+deserialization while operating on the supplied serialization context.
 Discard a codec after a custom serializer panics; error recovery via `Result`
 does not imply that backend contexts recover from unwinding.
 
