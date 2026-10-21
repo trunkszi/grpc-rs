@@ -48,12 +48,14 @@ fn error_tokens(message: &str) -> TokenStream {
 }
 
 struct Service {
-    is_pub: bool,
+    vis: String,
+    supers: String,
     name: String,
     methods: Vec<Method>,
 }
 
 struct Method {
+    attrs: Vec<String>,
     name: String,
     request: String,
     response: String,
@@ -87,15 +89,6 @@ impl Cardinality {
             Self::BidiStreaming => "BidiStreaming",
         }
     }
-
-    fn merge(self, other: Self) -> Result<Self, String> {
-        match (self, other) {
-            (left, right) if left == right => Ok(left),
-            (Self::Unary, value) | (value, Self::Unary) => Ok(value),
-            (Self::ClientStreaming, Self::ServerStreaming) | (Self::ServerStreaming, Self::ClientStreaming) => Ok(Self::BidiStreaming),
-            _ => Err("conflicting RPC cardinality attributes".to_string()),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -107,22 +100,12 @@ enum Tok {
 
 fn parse_package(attr: &str) -> Result<String, String> {
     let tokens = lex(attr)?;
-    if tokens.is_empty() {
-        return Ok(String::new());
-    }
-    if !ident_is(&tokens, 0, "package") || !sym_is(&tokens, 1, "=") {
-        return Err("expected `package = \"...\"`".to_string());
-    }
-    let Some(package) = str_at(&tokens, 2) else {
-        return Err("package must be a string literal".to_string());
-    };
+    if tokens.is_empty() { return Ok(String::new()); }
+    if !ident_is(&tokens, 0, "package") || !sym_is(&tokens, 1, "=") { return Err("expected `package = \"...\"`".to_string()); }
+    let Some(package) = str_at(&tokens, 2) else { return Err("package must be a string literal".to_string()); };
     let mut end = 3;
-    if sym_is(&tokens, end, ",") {
-        end += 1;
-    }
-    if end != tokens.len() {
-        return Err("unexpected tokens after package".to_string());
-    }
+    if sym_is(&tokens, end, ",") { end += 1; }
+    if end != tokens.len() { return Err("unexpected tokens after package".to_string()); }
     if !valid_package(package) {
         return Err(format!("invalid package `{package}`"));
     }
@@ -132,37 +115,35 @@ fn parse_package(attr: &str) -> Result<String, String> {
 fn parse_service(item: &str) -> Result<Service, String> {
     let tokens = lex(item)?;
     let mut index = skip_attributes(&tokens)?;
-    let mut is_pub = false;
+    let mut vis = String::new();
     if ident_is(&tokens, index, "pub") {
-        is_pub = true;
         index += 1;
         if sym_is(&tokens, index, "(") {
-            let (next, _) = take_group(&tokens, index, "(", ")")?;
+            let (next, inner) = take_group(&tokens, index, "(", ")")?;
+            vis = format!("pub({}) ", render_tokens(inner));
             index = next;
+        } else {
+            vis = String::from("pub ");
         }
     }
-    if ident_is(&tokens, index, "unsafe") {
-        return Err("unsafe traits are not supported".to_string());
-    }
-    if !ident_is(&tokens, index, "trait") {
-        return Err("grpc_service expects a trait".to_string());
-    }
+    if ident_is(&tokens, index, "unsafe") { return Err("unsafe traits are not supported".to_string()); }
+    if !ident_is(&tokens, index, "trait") { return Err("grpc_service expects a trait".to_string()); }
     index += 1;
-    let Some(name) = ident_at(&tokens, index) else {
-        return Err("trait is missing a name".to_string());
-    };
+    let Some(name) = ident_at(&tokens, index) else { return Err("trait is missing a name".to_string()); };
     let name = name.to_string();
     ensure_ident(&name, "trait")?;
-    if has_generics(&tokens, index) {
-        return Err("generic service traits are not supported".to_string());
-    }
     let body_at = tokens.iter().position(|token| sym(token, "{")).ok_or_else(|| "trait is missing a body".to_string())?;
+    let head = &tokens[index + 1..body_at];
+    if head.iter().any(|token| sym(token, "<") || ident_token(token) == Some("where")) { return Err("generic service traits are not supported".to_string()); }
+    let supers = render_tokens(head);
     let (_, body) = take_group(&tokens, body_at, "{", "}")?;
     let mut methods = Vec::new();
     for method in split_methods(body)? {
         methods.push(parse_method(&method)?);
     }
-    Ok(Service { is_pub, name, methods })
+    let service = Service { vis, supers, name, methods };
+    reject_collisions(&service)?;
+    Ok(service)
 }
 
 fn skip_attributes(tokens: &[Tok]) -> Result<usize, String> {
@@ -174,33 +155,15 @@ fn skip_attributes(tokens: &[Tok]) -> Result<usize, String> {
     Ok(index)
 }
 
-fn has_generics(tokens: &[Tok], name_index: usize) -> bool {
-    for token in &tokens[name_index + 1..] {
-        if sym(token, "{") {
-            return false;
-        }
-        if sym(token, "<") || ident_token(token) == Some("where") {
-            return true;
-        }
-    }
-    false
-}
-
 fn split_methods(tokens: &[Tok]) -> Result<Vec<Vec<Tok>>, String> {
     let mut methods = Vec::new();
     let mut current = Vec::new();
     let mut depth = 0i32;
     for token in tokens {
-        if matches!(token, Tok::Sym(sym) if sym == "(" || sym == "[" || sym == "{") {
-            depth += 1;
-        }
-        if matches!(token, Tok::Sym(sym) if sym == ")" || sym == "]" || sym == "}") {
-            depth -= 1;
-        }
+        if matches!(token, Tok::Sym(sym) if sym == "(" || sym == "[" || sym == "{") { depth += 1; }
+        if matches!(token, Tok::Sym(sym) if sym == ")" || sym == "]" || sym == "}") { depth -= 1; }
         if depth == 0 && sym(token, ";") {
-            if current.is_empty() {
-                return Err("empty method declaration".to_string());
-            }
+            if current.is_empty() { return Err("empty method declaration".to_string()); }
             methods.push(std::mem::take(&mut current));
         } else {
             current.push(token.clone());
@@ -211,27 +174,26 @@ fn split_methods(tokens: &[Tok]) -> Result<Vec<Vec<Tok>>, String> {
 
 fn parse_method(tokens: &[Tok]) -> Result<Method, String> {
     let mut index = 0;
-    let mut cardinality = Cardinality::Unary;
+    let mut attrs = Vec::new();
+    let mut flags = Vec::new();
     while sym_is(tokens, index, "#") {
         let (next, inner) = take_group(tokens, index + 1, "[", "]")?;
-        if let Some(found) = cardinality_in(inner)? {
-            cardinality = cardinality.merge(found)?;
+        if let Some(found) = bare_cardinality(inner) {
+            flags.push(found);
+        } else {
+            attrs.push(format!("#[{}]", render_tokens(inner)));
         }
         index = next;
     }
-    if ident_is(tokens, index, "async") {
-        return Err("synchronous services cannot declare async methods".to_string());
-    }
-    if !ident_is(tokens, index, "fn") {
-        return Err("expected a method".to_string());
-    }
+    let cardinality = resolve_cardinality(&flags)?;
+    if ident_is(tokens, index, "async") { return Err("synchronous services cannot declare async methods".to_string()); }
+    if !ident_is(tokens, index, "fn") { return Err("expected a method".to_string()); }
     index += 1;
-    let Some(name) = ident_at(tokens, index) else {
-        return Err("method is missing a name".to_string());
-    };
+    let Some(name) = ident_at(tokens, index) else { return Err("method is missing a name".to_string()); };
     let name = name.to_string();
     ensure_ident(&name, "method")?;
     index += 1;
+    if sym_is(tokens, index, "<") { return Err("generic methods are not supported".to_string()); }
     if !sym_is(tokens, index, "(") {
         return Err(format!("method {name} is missing request parentheses"));
     }
@@ -239,39 +201,137 @@ fn parse_method(tokens: &[Tok]) -> Result<Method, String> {
     let request = argument_type(args)?;
     index = next;
     let arrow = tokens[index..].iter().position(|token| sym(token, "->")).ok_or_else(|| format!("method {name} is missing ->"))?;
-    let response = render_type(&tokens[index + arrow + 1..])?;
-    Ok(Method { name, request, response, cardinality })
+    let response_tokens = &tokens[index + arrow + 1..];
+    if response_tokens.iter().any(|token| ident_token(token) == Some("where")) {
+        return Err(format!("method {name} cannot declare a where clause"));
+    }
+    let response = render_type(response_tokens)?;
+    Ok(Method { attrs, name, request, response, cardinality })
 }
 
-fn cardinality_in(tokens: &[Tok]) -> Result<Option<Cardinality>, String> {
-    let mut found: Option<Cardinality> = None;
+fn bare_cardinality(tokens: &[Tok]) -> Option<Cardinality> {
+    let mut last = None;
+    let mut want_ident = true;
     for token in tokens {
-        let Some(next) = ident_token(token).and_then(Cardinality::named) else { continue };
-        found = Some(match found {
-            None => next,
-            Some(current) => current.merge(next)?,
-        });
+        if want_ident {
+            last = Some(ident_token(token)?);
+            want_ident = false;
+        } else if sym(token, "::") {
+            want_ident = true;
+        } else {
+            return None;
+        }
     }
-    Ok(found)
+    if want_ident { None } else { last.and_then(Cardinality::named) }
+}
+
+fn resolve_cardinality(flags: &[Cardinality]) -> Result<Cardinality, String> {
+    let mut client = false;
+    let mut server = false;
+    let mut bidi = false;
+    for flag in flags {
+        match flag {
+            Cardinality::Unary => {}
+            Cardinality::ClientStreaming => client = true,
+            Cardinality::ServerStreaming => server = true,
+            Cardinality::BidiStreaming => bidi = true,
+        }
+    }
+    if bidi && (client || server) { return Err("conflicting RPC cardinality attributes".to_string()); }
+    Ok(match (client, server, bidi) {
+        (_, _, true) | (true, true, _) => Cardinality::BidiStreaming,
+        (true, false, _) => Cardinality::ClientStreaming,
+        (false, true, _) => Cardinality::ServerStreaming,
+        _ => Cardinality::Unary,
+    })
+}
+
+fn reject_collisions(service: &Service) -> Result<(), String> {
+    let mut consts = Vec::new();
+    let mut rpcs = Vec::new();
+    for method in &service.methods {
+        if is_reserved(&method.name) {
+            return Err(format!("method `{}` collides with generated client methods", method.name));
+        }
+        let constant = const_name(&service.name, &method.name);
+        let rpc = rpc_ident(&method.name);
+        let const_taken = consts.iter().any(|seen| seen == &constant);
+        let rpc_taken = rpcs.iter().any(|seen| seen == &rpc);
+        if const_taken || rpc_taken {
+            return Err(format!("method `{}` duplicates a method descriptor", method.name));
+        }
+        consts.push(constant);
+        rpcs.push(rpc);
+    }
+    Ok(())
+}
+
+fn is_reserved(name: &str) -> bool {
+    matches!(cooked(name), "new" | "with_codec" | "with_compression" | "codec" | "compression" | "transport" | "handler")
 }
 
 fn argument_type(tokens: &[Tok]) -> Result<String, String> {
-    if tokens.is_empty() {
-        return Err("method requires a request type".to_string());
-    }
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
     let mut depth = 0i32;
-    let mut colon = None;
+    for token in tokens {
+        if sym(token, "<") || sym(token, "(") || sym(token, "[") { depth += 1; }
+        if sym(token, ">") || sym(token, ")") || sym(token, "]") { depth -= 1; }
+        if depth == 0 && sym(token, ",") {
+            if !current.is_empty() { parts.push(std::mem::take(&mut current)); }
+            continue;
+        }
+        current.push(token.clone());
+    }
+    if !current.is_empty() { parts.push(current); }
+    let mut messages = Vec::new();
+    for part in &parts {
+        if is_receiver(part) { continue; }
+        messages.push(arg_ty(part)?);
+    }
+    match &messages[..] {
+        [ty] => Ok(ty.clone()),
+        _ => Err("method accepts one request type".to_string()),
+    }
+}
+
+fn is_receiver(tokens: &[Tok]) -> bool {
+    match tokens.first() {
+        Some(Tok::Ident(name)) if name == "self" => true,
+        Some(Tok::Ident(name)) if name == "mut" => matches!(tokens.get(1), Some(Tok::Ident(next)) if next == "self"),
+        Some(Tok::Sym(amp)) if amp == "&" => {
+            matches!(tokens.get(1), Some(Tok::Ident(name)) if name == "self")
+                || matches!((tokens.get(1), tokens.get(2)), (Some(Tok::Ident(mode)), Some(Tok::Ident(name))) if mode == "mut" && name == "self")
+        }
+        _ => false,
+    }
+}
+
+fn arg_ty(tokens: &[Tok]) -> Result<String, String> {
+    let mut depth = 0i32;
     for (index, token) in tokens.iter().enumerate() {
         if sym(token, "<") || sym(token, "(") || sym(token, "[") { depth += 1; }
         if sym(token, ">") || sym(token, ")") || sym(token, "]") { depth -= 1; }
-        if depth == 0 && sym(token, ":") { colon = Some(index); }
+        if depth == 0 && sym(token, ":") { return render_type(&tokens[index + 1..]); }
     }
-    let start = colon.map_or(0, |index| index + 1);
-    render_type(&tokens[start..])
+    render_type(tokens)
 }
 
 fn render_type(tokens: &[Tok]) -> Result<String, String> {
     if tokens.is_empty() { Err("missing message type".to_string()) } else { Ok(render_tokens(tokens)) }
+}
+
+fn push_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 fn render_tokens(tokens: &[Tok]) -> String {
@@ -287,7 +347,7 @@ fn render_tokens(tokens: &[Tok]) -> String {
             Tok::Str(text) => {
                 if word { out.push(' '); }
                 out.push('"');
-                out.push_str(text);
+                push_escaped(&mut out, text);
                 out.push('"');
                 word = true;
             }
@@ -318,10 +378,25 @@ fn lex(source: &str) -> Result<Vec<Tok>, String> {
             index += 2;
             continue;
         }
+        if let Some((quote_at, raw, hashes)) = string_prefix(&chars, index) {
+            let (next, text) = if raw { read_raw(&chars, quote_at + 1, hashes)? } else { read_string(&chars, quote_at)? };
+            tokens.push(Tok::Str(text));
+            index = next;
+            continue;
+        }
         if ch == '"' {
             let (next, text) = read_string(&chars, index)?;
             tokens.push(Tok::Str(text));
             index = next;
+            continue;
+        }
+        if ch == 'r' && chars.get(index + 1) == Some(&'#') && chars.get(index + 2).is_some_and(|next| *next == '_' || next.is_ascii_alphabetic()) {
+            index += 2;
+            let start = index;
+            while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') { index += 1; }
+            let mut name = String::from("r#");
+            name.extend(chars[start..index].iter());
+            tokens.push(Tok::Ident(name));
             continue;
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
@@ -339,15 +414,38 @@ fn lex(source: &str) -> Result<Vec<Tok>, String> {
     Ok(tokens)
 }
 
+fn string_prefix(chars: &[char], index: usize) -> Option<(usize, bool, usize)> {
+    let bytes = chars.get(index..)?;
+    let mut cursor = 0;
+    if matches!(bytes.first(), Some('b' | 'c')) { cursor = 1; }
+    let mut raw = false;
+    if bytes.get(cursor) == Some(&'r') { raw = true; cursor += 1; }
+    let mut hashes = 0usize;
+    if raw {
+        while bytes.get(cursor) == Some(&'#') { hashes += 1; cursor += 1; }
+    }
+    if cursor == 0 || bytes.get(cursor) != Some(&'"') { None } else { Some((index + cursor, raw, hashes)) }
+}
+
+fn read_raw(chars: &[char], mut index: usize, hashes: usize) -> Result<(usize, String), String> {
+    let mut text = String::new();
+    while index < chars.len() {
+        if chars[index] == '"' && (0..hashes).all(|offset| chars.get(index + 1 + offset) == Some(&'#')) { return Ok((index + 1 + hashes, text)); }
+        text.push(chars[index]);
+        index += 1;
+    }
+    Err("unterminated string".to_string())
+}
+
 fn read_string(chars: &[char], start: usize) -> Result<(usize, String), String> {
     let mut index = start + 1;
     let mut text = String::new();
     while index < chars.len() {
         let ch = chars[index];
         if ch == '\\' {
-            let Some(escaped) = chars.get(index + 1).copied() else { break };
-            text.push(match escaped { 'n' => '\n', 't' => '\t', 'r' => '\r', other => other });
-            index += 2;
+            let (decoded, next) = decode_escape(chars, index)?;
+            text.push(decoded);
+            index = next;
             continue;
         }
         if ch == '"' { return Ok((index + 1, text)); }
@@ -355,6 +453,27 @@ fn read_string(chars: &[char], start: usize) -> Result<(usize, String), String> 
         index += 1;
     }
     Err("unterminated string".to_string())
+}
+
+fn decode_escape(chars: &[char], index: usize) -> Result<(char, usize), String> {
+    let Some(kind) = chars.get(index + 1).copied() else { return Err("unterminated string".to_string()); };
+    let simple = match kind { 'n' => Some('\n'), 'r' => Some('\r'), 't' => Some('\t'), '\\' => Some('\\'), '\'' => Some('\''), '"' => Some('"'), '0' => Some('\0'), _ => None };
+    if let Some(ch) = simple { return Ok((ch, index + 2)); }
+    if kind == 'x' {
+        let hex = (0..2).map(|offset| chars.get(index + 2 + offset).copied()).collect::<Option<String>>().filter(|hex| hex.chars().all(|ch| ch.is_ascii_hexdigit())).ok_or_else(|| "bad hex escape".to_string())?;
+        return Ok((char::from(u8::from_str_radix(&hex, 16).map_err(|_| "bad hex escape".to_string())?), index + 4));
+    }
+    if kind == 'u' && chars.get(index + 2) == Some(&'{') {
+        let end = chars[index + 3..].iter().position(|ch| *ch == '}').ok_or_else(|| "bad unicode escape".to_string())?;
+        let hex: String = chars[index + 3..index + 3 + end].iter().collect();
+        if (1..=6).contains(&hex.len())
+            && let Ok(code) = u32::from_str_radix(&hex, 16)
+            && let Some(ch) = char::from_u32(code)
+        {
+            return Ok((ch, index + 4 + end));
+        }
+    }
+    Err("unknown string escape".to_string())
 }
 
 fn take_group<'a>(tokens: &'a [Tok], start: usize, open: &str, close: &str) -> Result<(usize, &'a [Tok]), String> {
@@ -370,38 +489,17 @@ fn take_group<'a>(tokens: &'a [Tok], start: usize, open: &str, close: &str) -> R
     Err(format!("unbalanced `{open}`"))
 }
 
-fn ident_is(tokens: &[Tok], index: usize, expected: &str) -> bool {
-    ident_at(tokens, index) == Some(expected)
-}
-
-fn ident_at(tokens: &[Tok], index: usize) -> Option<&str> {
-    tokens.get(index).and_then(ident_token)
-}
-
-fn ident_token(token: &Tok) -> Option<&str> {
-    match token { Tok::Ident(text) => Some(text.as_str()), _ => None }
-}
-
-fn sym_is(tokens: &[Tok], index: usize, expected: &str) -> bool {
-    tokens.get(index).is_some_and(|token| sym(token, expected))
-}
-
-fn sym(token: &Tok, expected: &str) -> bool {
-    matches!(token, Tok::Sym(text) if text == expected)
-}
-
-fn str_at(tokens: &[Tok], index: usize) -> Option<&str> {
-    match tokens.get(index) { Some(Tok::Str(text)) => Some(text.as_str()), _ => None }
-}
+fn ident_is(tokens: &[Tok], index: usize, expected: &str) -> bool { ident_at(tokens, index) == Some(expected) }
+fn ident_at(tokens: &[Tok], index: usize) -> Option<&str> { tokens.get(index).and_then(ident_token) }
+fn ident_token(token: &Tok) -> Option<&str> { match token { Tok::Ident(text) => Some(text.as_str()), _ => None } }
+fn sym_is(tokens: &[Tok], index: usize, expected: &str) -> bool { tokens.get(index).is_some_and(|token| sym(token, expected)) }
+fn sym(token: &Tok, expected: &str) -> bool { matches!(token, Tok::Sym(text) if text == expected) }
+fn str_at(tokens: &[Tok], index: usize) -> Option<&str> { match tokens.get(index) { Some(Tok::Str(text)) => Some(text.as_str()), _ => None } }
 
 fn emit(package: &str, service: &Service) -> String {
     let mut out = String::new();
-    emit_support(&mut out, service);
-    emit_constants(&mut out, package, service);
-    emit_handler(&mut out, service);
-    emit_channel(&mut out, service);
-    emit_client(&mut out, service);
-    emit_server(&mut out, package, service);
+    emit_support(&mut out, service); emit_constants(&mut out, package, service); emit_handler(&mut out, service);
+    emit_channel(&mut out, service); emit_client(&mut out, service); emit_server(&mut out, package, service);
     out
 }
 
@@ -420,8 +518,10 @@ fn emit_support(out: &mut String, service: &Service) {
 
 fn emit_constants(out: &mut String, package: &str, service: &Service) {
     let vis = visibility(service);
-    let mut names = Vec::new();
     for method in &service.methods {
+        for attr in &method.attrs {
+            put(out, attr);
+        }
         let constant = const_name(&service.name, &method.name);
         let path = method_path(package, &service.name, &method.name);
         let card = method.cardinality.as_path();
@@ -430,15 +530,11 @@ fn emit_constants(out: &mut String, package: &str, service: &Service) {
         put(out, &format!("        \"{path}\","));
         put(out, &format!("        ::grpc_core::RpcCardinality::{card},"));
         put(out, "    );");
-        names.push(constant);
     }
-    let table = descriptor_table(&service.name);
-    let joined = names.join(", ");
-    put(out, &format!("{vis}const {table}: [::grpc_core::MethodDescriptor; {}] = [{joined}];", names.len()));
 }
 
 fn emit_handler(out: &mut String, service: &Service) {
-    put(out, &format!("{}trait {} {{", visibility(service), service.name));
+    put(out, &format!("{}trait {}{} {{", visibility(service), service.name, service.supers));
     for method in &service.methods {
         emit_signature(out, method, false, false);
     }
@@ -448,6 +544,9 @@ fn emit_handler(out: &mut String, service: &Service) {
 fn emit_channel(out: &mut String, service: &Service) {
     put(out, &format!("{}trait {}Channel<C> {{", visibility(service), service.name));
     for method in &service.methods {
+        for attr in &method.attrs {
+            put(out, &format!("    {attr}"));
+        }
         let request = request_ty(method);
         let response = response_ty(method);
         put(out, &format!("    fn {}(", method.name));
@@ -463,22 +562,14 @@ fn emit_channel(out: &mut String, service: &Service) {
 
 fn emit_client(out: &mut String, service: &Service) {
     emit_shell(out, service, false);
-    if service.methods.is_empty() {
-        return;
-    }
+    if service.methods.is_empty() { return; }
     let client = format!("{}Client", service.name);
     let channel = format!("{}Channel", service.name);
     put(out, &format!("impl<T, C> {client}<T, C> where T: {channel}<C> {{"));
     for method in &service.methods {
         emit_signature(out, method, true, true);
         let constant = const_name(&service.name, &method.name);
-        put(out, &format!("        {channel}::{}(", method.name));
-        put(out, "            &mut self.transport,");
-        put(out, "            &mut self.codec,");
-        put(out, &format!("            &{constant},"));
-        put(out, "            &self.compression,");
-        put(out, "            request,");
-        put(out, "        );");
+        put(out, &format!("        {channel}::{}(\n            &mut self.transport,\n            &mut self.codec,\n            &{constant},\n            &self.compression,\n            request,\n        )", method.name));
         put(out, "    }");
     }
     put(out, "}");
@@ -490,26 +581,17 @@ fn emit_server(out: &mut String, package: &str, service: &Service) {
     let server = format!("{name}Server");
     let module = support_module(service);
     let qualified = qualified_service(package, name);
-    let table = descriptor_table(name);
-    put(out, &format!("impl<S, C> {module}::ServiceHandler for {server}<S, C>"));
-    put(out, "where");
-    put(out, &format!("    S: {name},"));
-    put(out, "{");
-    put(out, "    fn service_name(&self) -> &'static str {");
-    put(out, &format!("        \"{qualified}\""));
-    put(out, "    }");
-    put(out, "    fn descriptors(&self) -> &'static [::grpc_core::MethodDescriptor] {");
-    put(out, &format!("        &{table}"));
-    put(out, "    }");
-    put(out, "}");
-    if service.methods.is_empty() {
-        return;
+    put(out, &format!("impl<S, C> {module}::ServiceHandler for {server}<S, C>\nwhere\n    S: {name},\n{{\n    fn service_name(&self) -> &'static str {{\n        \"{qualified}\"\n    }}\n    fn descriptors(&self) -> &'static [::grpc_core::MethodDescriptor] {{\n        &["));
+    for method in &service.methods {
+        for attr in &method.attrs { put(out, &format!("            {attr}")); }
+        put(out, &format!("            {},", const_name(name, &method.name)));
     }
+    put(out, "        ]\n    }\n}");
+    if service.methods.is_empty() { return; }
     put(out, &format!("impl<S, C> {server}<S, C> where S: {name} {{"));
     for method in &service.methods {
         emit_signature(out, method, true, true);
-        put(out, &format!("        self.handler.{}(request);", method.name));
-        put(out, "    }");
+        put(out, &format!("        self.handler.{}(request)\n    }}", method.name));
     }
     put(out, "}");
 }
@@ -517,44 +599,8 @@ fn emit_server(out: &mut String, package: &str, service: &Service) {
 fn emit_shell(out: &mut String, service: &Service, server: bool) {
     let vis = visibility(service);
     let module = support_module(service);
-    let (ty, param, field) = if server {
-        (format!("{}Server", service.name), "S", "handler")
-    } else {
-        (format!("{}Client", service.name), "T", "transport")
-    };
-    put(out, &format!("{vis}struct {ty}<{param}, C = {module}::DefaultCodec> {{"));
-    put(out, &format!("    {field}: {param},"));
-    put(out, "    codec: C,");
-    put(out, &format!("    compression: {OPT}<{COMP}>,"));
-    put(out, "}");
-    put(out, &format!("impl<{param}, C> {ty}<{param}, C> {{"));
-    put(out, &format!("    pub fn new({field}: {param}, codec: C) -> Self {{"));
-    put(out, &format!("        Self {{ {field}, codec, compression: {OPT}::None }}"));
-    put(out, "    }");
-    put(out, &format!("    pub fn with_codec<NewCodec>(self) -> {ty}<{param}, NewCodec>"));
-    put(out, "    where");
-    put(out, "        NewCodec: ::core::default::Default,");
-    put(out, "    {");
-    put(out, &format!("        {ty} {{"));
-    put(out, &format!("            {field}: self.{field},"));
-    put(out, "            codec: ::core::default::Default::default(),");
-    put(out, "            compression: self.compression,");
-    put(out, "        }");
-    put(out, "    }");
-    put(out, &format!("    pub fn with_compression(mut self, algorithm: {COMP}) -> Self {{"));
-    put(out, &format!("        self.compression = {OPT}::Some(algorithm);"));
-    put(out, "        self");
-    put(out, "    }");
-    put(out, "    pub fn codec(&self) -> &C {");
-    put(out, "        &self.codec");
-    put(out, "    }");
-    put(out, &format!("    pub fn {field}(&self) -> &{param} {{"));
-    put(out, &format!("        &self.{field}"));
-    put(out, "    }");
-    put(out, &format!("    pub fn compression(&self) -> {OPT}<&{COMP}> {{"));
-    put(out, "        self.compression.as_ref()");
-    put(out, "    }");
-    put(out, "}");
+    let (ty, param, field) = if server { (format!("{}Server", service.name), "S", "handler") } else { (format!("{}Client", service.name), "T", "transport") };
+    out.push_str(&format!("{vis}struct {ty}<{param}, C = {module}::DefaultCodec> {{\n    {field}: {param},\n    codec: C,\n    compression: {OPT}<{COMP}>,\n}}\nimpl<{param}, C> {ty}<{param}, C> {{\n    pub fn new({field}: {param}, codec: C) -> Self {{\n        Self {{ {field}, codec, compression: {OPT}::None }}\n    }}\n    pub fn with_codec<NewCodec>(self) -> {ty}<{param}, NewCodec>\n    where\n        NewCodec: ::core::default::Default,\n    {{\n        {ty} {{\n            {field}: self.{field},\n            codec: ::core::default::Default::default(),\n            compression: self.compression,\n        }}\n    }}\n    pub fn with_compression(mut self, algorithm: {COMP}) -> Self {{\n        self.compression = {OPT}::Some(algorithm);\n        self\n    }}\n    pub fn codec(&self) -> &C {{ &self.codec }}\n    pub fn {field}(&self) -> &{param} {{ &self.{field} }}\n    pub fn compression(&self) -> {OPT}<&{COMP}> {{ self.compression.as_ref() }}\n}}\n"));
 }
 
 fn emit_signature(out: &mut String, method: &Method, public: bool, body: bool) {
@@ -562,6 +608,9 @@ fn emit_signature(out: &mut String, method: &Method, public: bool, body: bool) {
     let tail = if body { "{" } else { ";" };
     let request = request_ty(method);
     let response = response_ty(method);
+    for attr in &method.attrs {
+        put(out, &format!("    {attr}"));
+    }
     put(out, &format!("    {prefix}fn {}(&mut self, request: {request})", method.name));
     put(out, &format!("    -> ::core::result::Result<{response}, {STATUS}> {tail}"));
 }
@@ -584,49 +633,25 @@ fn response_ty(method: &Method) -> String {
 
 fn envelope(inner: &str, stream: bool, response: bool) -> String {
     let wrapper = if response { "Response" } else { "Request" };
-    if stream {
-        format!("::grpc_core::{wrapper}<::std::vec::Vec<{inner}>>")
-    } else {
-        format!("::grpc_core::{wrapper}<{inner}>")
-    }
+    if stream { format!("::grpc_core::{wrapper}<::std::vec::Vec<{inner}>>") } else { format!("::grpc_core::{wrapper}<{inner}>") }
 }
-
-fn put(out: &mut String, line: &str) {
-    out.push_str(line);
-    out.push('\n');
-}
-
-fn visibility(service: &Service) -> &'static str {
-    if service.is_pub { "pub " } else { "" }
-}
-
-fn support_module(service: &Service) -> String {
-    format!("{}_grpc_support", reshape(&service.name, false))
-}
-
-fn const_name(service: &str, method: &str) -> String {
-    format!("{}_{}", reshape(service, true), reshape(method, true))
-}
-
-fn descriptor_table(service: &str) -> String {
-    format!("{}_METHOD_DESCRIPTORS", reshape(service, true))
-}
-
-fn qualified_service(package: &str, service: &str) -> String {
-    if package.is_empty() { service.to_string() } else { format!("{package}.{service}") }
-}
-
-fn method_path(package: &str, service: &str, method: &str) -> String {
-    format!("/{}/{}", qualified_service(package, service), rpc_ident(method))
-}
+fn put(out: &mut String, line: &str) { out.push_str(line); out.push('\n'); }
+fn visibility(service: &Service) -> &str { &service.vis }
+fn support_module(service: &Service) -> String { format!("{}_grpc_support", reshape(cooked(&service.name), false)) }
+fn const_name(service: &str, method: &str) -> String { format!("{}_{}", reshape(cooked(service), true), reshape(cooked(method), true)) }
+fn cooked(name: &str) -> &str { name.strip_prefix("r#").unwrap_or(name) }
+fn qualified_service(package: &str, service: &str) -> String { if package.is_empty() { service.to_string() } else { format!("{package}.{service}") } }
+fn method_path(package: &str, service: &str, method: &str) -> String { format!("/{}/{}", qualified_service(package, service), rpc_ident(method)) }
 
 fn rpc_ident(name: &str) -> String {
-    if name.contains('_') || name.chars().all(|ch| !ch.is_ascii_uppercase()) {
+    let name = cooked(name);
+    let head = name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase());
+    if name.contains('_') || !head {
         let mut out = String::new();
         for part in name.split('_').filter(|part| !part.is_empty()) {
             out.push_str(&capitalize(part));
         }
-        out
+        if out.is_empty() { name.to_string() } else { out }
     } else {
         name.to_string()
     }
@@ -634,9 +659,7 @@ fn rpc_ident(name: &str) -> String {
 
 fn capitalize(part: &str) -> String {
     let mut chars = part.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
+    let Some(first) = chars.next() else { return String::new(); };
     let mut out = String::new();
     out.extend(first.to_uppercase());
     out.push_str(chars.as_str());
@@ -646,45 +669,23 @@ fn capitalize(part: &str) -> String {
 fn reshape(name: &str, ascii_upper: bool) -> String {
     let mut out = String::new();
     for (index, ch) in name.chars().enumerate() {
-        if ch.is_ascii_uppercase() && index > 0 {
-            out.push('_');
-        }
-        if ascii_upper {
-            out.push(ch.to_ascii_uppercase());
-        } else {
-            out.push(ch.to_ascii_lowercase());
-        }
+        if ch.is_ascii_uppercase() && index > 0 { out.push('_'); }
+        out.push(if ascii_upper { ch.to_ascii_uppercase() } else { ch.to_ascii_lowercase() });
     }
     out
 }
-
 fn ensure_ident(name: &str, role: &str) -> Result<(), String> {
-    if is_rust_ident(name) && !is_keyword(name) {
-        Ok(())
-    } else {
-        Err(format!("{role} `{name}` is not a usable identifier"))
-    }
+    let bare = cooked(name);
+    let raw = name.starts_with("r#");
+    if (name == bare || raw) && is_rust_ident(bare) && (raw || !is_keyword(bare)) { Ok(()) } else { Err(format!("{role} `{name}` is not a usable identifier")) }
 }
-
-fn valid_package(package: &str) -> bool {
-    !package.is_empty() && package.split('.').all(|part| is_rust_ident(part) && !is_keyword(part))
-}
-
+fn valid_package(package: &str) -> bool { !package.is_empty() && package.split('.').all(|part| !part.is_empty() && is_rust_ident(part)) }
 fn is_rust_ident(name: &str) -> bool {
     let mut chars = name.chars();
-    match chars.next() {
-        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic()) && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
-
 fn is_keyword(name: &str) -> bool {
-    " as async await break const continue crate dyn else enum extern false fn for if impl in let \
-     loop match mod move mut pub ref return self Self static struct super trait true type unsafe \
-     use where while gen union abstract become box do final macro override priv typeof unsized \
-     virtual yield try "
-        .contains(&format!(" {name} "))
+    " as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while gen union abstract become box do final macro override priv typeof unsized virtual yield try ".contains(&format!(" {name} "))
 }
 
 #[cfg(test)]
@@ -723,28 +724,55 @@ mod tests {
     }
 
     #[test]
-    fn pascal_cases_snake_methods() {
-        let output = expand_source(r#"package = "demo.v1""#, "pub trait Echo { fn say_hello(request: demo::Ping) -> demo::Pong; }");
-        assert_has(&output, "\"/demo.v1.Echo/SayHello\"");
-        assert_has(&output, "ECHO_SAY_HELLO");
-        assert!(!output.contains("compile_error"), "{output}");
-    }
-
-    #[test]
-    fn unary_messages_are_not_vectors() {
-        let output = expand_source("", "trait Echo { fn unary(Ping) -> Pong; }");
-        assert_has(&output, "\"/Echo/Unary\"");
-        assert!(!output.contains("Vec"), "{output}");
-        assert!(!output.contains("pub struct EchoClient"), "{output}");
-    }
-
-    #[test]
     fn merges_stream_directions_and_reports_parse_errors() {
         let output = expand_source("", "trait Echo { #[client_streaming] #[server_streaming] fn chat(Ping) -> Pong; }");
         assert_has(&output, "BidiStreaming");
         assert_has(&output, "\"/Echo/Chat\"");
         let conflict = expand_source("", "trait Echo { #[bidi_streaming] #[server_streaming] fn chat(Ping) -> Pong; }");
         assert_has(&conflict, "compile_error");
+        let reversed = expand_source("", "trait Echo { #[client_streaming] #[server_streaming] #[bidi_streaming] fn chat(Ping) -> Pong; }");
+        assert_has(&reversed, "compile_error");
         assert_has(&expand_source("", "fn not_a_trait() {}"), "compile_error");
+    }
+
+    #[test]
+    fn rejects_bad_shapes_and_compiles_returns() {
+        let cfg = expand_source("", "trait Echo { #[cfg(not(server_streaming))] fn unary(Ping) -> Pong; }");
+        assert!(cfg.contains("#[cfg(not(server_streaming))]"), "{cfg}");
+        assert!(!cfg.contains("ServerStreaming"), "{cfg}");
+        assert_has(&expand_source("", "pub(crate) trait Echo { fn unary(Ping) -> Pong; }"), "pub(crate) struct EchoClient");
+        assert_has(&expand_source(r#"package = r"demo.v1""#, "trait Echo { fn unary(Ping) -> Pong; }"), "\"/demo.v1.Echo/Unary\"");
+        assert_has(&expand_source(r#"package = "demo\u{2e}v1""#, "trait Echo { fn unary(Ping) -> Pong; }"), "\"/demo.v1.Echo/Unary\"");
+        assert_has(&expand_source("", "trait Echo { fn getHTTP(Ping) -> Pong; }"), "\"/Echo/GetHTTP\"");
+        assert_has(&expand_source("", "trait Echo: Send { fn unary(Ping) -> Pong; }"), "trait Echo:Send {");
+        assert_has(&expand_source("", "trait Echo { fn r#type(Ping) -> Pong; }"), "fn r#type(");
+        assert_has(&expand_source(r#"package = "demo.v1""#, "pub trait Echo { fn say_hello(request: demo::Ping) -> demo::Pong; }"), "\"/demo.v1.Echo/SayHello\"");
+        let unary = expand_source("", "trait Echo { fn unary(Ping) -> Pong; }");
+        assert_has(&unary, "\"/Echo/Unary\"");
+        assert!(!unary.contains("Vec") && !unary.contains("pub struct EchoClient"), "{unary}");
+        for item in ["fn unary(request: Ping, ctx: u64) -> Pong;", "fn unary(Ping) -> Pong where Pong: Send;", "fn with_codec(Ping) -> Pong;", "fn foo2(Ping) -> Pong; fn foo_2(Ping) -> Pong;", "fn unary<T>(T) -> T;", "fn only(&mut self) -> Pong;"] {
+            assert_has(&expand_source("", &format!("trait Echo {{ {item} }}")), "compile_error");
+        }
+        let output = expand_source(r#"package = "demo.v1""#, "pub trait Echo { fn unary(Ping) -> Pong; #[server_streaming] fn server(Ping) -> Pong; }");
+        assert!(output.contains("self.handler.unary(request)\n"), "{output}");
+        assert!(output.contains("request,\n        )\n"), "{output}");
+        assert!(!output.contains("compile_error"), "{output}");
+        compile_generated(&output);
+    }
+
+    fn compile_generated(generated: &str) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("grpc-macros-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let core = dir.join("core.rs");
+        let probe = dir.join("probe.rs");
+        std::fs::write(&core, "#[derive(Clone, Copy)] pub struct MethodDescriptor; impl MethodDescriptor { pub const fn new(_: &'static str, _: RpcCardinality) -> Self { Self } } #[derive(Clone, Copy)] pub enum RpcCardinality { Unary, ServerStreaming, ClientStreaming, BidiStreaming } pub struct Request<T> { _m: ::core::marker::PhantomData<T> } pub struct Response<T> { _m: ::core::marker::PhantomData<T> } pub mod compression { #[derive(Clone, Copy)] pub struct CompressionAlgorithm; } pub mod status { pub struct Status; }").expect("core");
+        std::fs::write(&probe, format!("pub struct Ping; pub struct Pong;\n{generated}")).expect("probe");
+        let rlib = dir.join("libgrpc_core.rlib");
+        let built = std::process::Command::new("rustc").args(["--edition=2024", "--crate-type=lib", "--crate-name=grpc_core", "-Dwarnings"]).arg(&core).arg("-o").arg(&rlib).output().expect("rustc");
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let checked = std::process::Command::new("rustc").args(["--edition=2024", "--crate-type=lib", "--crate-name=probe", "-Dwarnings", "--extern"]).arg(format!("grpc_core={}", rlib.display())).arg(&probe).arg("--out-dir").arg(&dir).output().expect("rustc");
+        assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }
