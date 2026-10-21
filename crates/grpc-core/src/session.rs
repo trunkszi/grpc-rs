@@ -113,7 +113,7 @@ struct Stream {
     outgoing_encoding: CompressionAlgorithm,
     outgoing: Rc<RefCell<Outbound>>,
     headers: Headers, header_bytes: usize,
-    initial: bool, sent_initial: bool, terminal: bool, closed: bool,
+    initial: bool, sent_initial: bool, terminal: bool, closed: bool, end_stream_serialized: bool,
     failure: Option<Status>, failure_taken: bool, http_status: u16,
     pending_trailers: Option<Vec<(String, String)>>,
     prefix: Vec<u8>, remaining: usize, reserved: usize,
@@ -129,7 +129,7 @@ pub struct GrpcSession<Role> {
     native: Native, config: SessionConfig, slots: StreamSlotMap,
     streams: BTreeMap<i32, Stream>,
     incoming: VecDeque<IncomingRequest>,
-    wire: Vec<u8>, transport_pending: Vec<u8>, transport_offset: usize,
+    wire: Vec<u8>, transport_pending: Vec<u8>, transport_offset: usize, transport_flushed: bool,
     failed: Option<Status>, draining: bool, role: PhantomData<Role>,
 }
 #[rustfmt::skip]
@@ -206,7 +206,7 @@ macro_rules! constructor {
                     native: Native::$variant(native), config, slots,
                     streams: BTreeMap::new(), incoming: VecDeque::new(),
                     wire: Vec::new(), transport_pending: Vec::new(),
-                    transport_offset: 0, failed: None, draining: false, role: PhantomData,
+                    transport_offset: 0, transport_flushed: true, failed: None, draining: false, role: PhantomData,
                 })
             }
         }
@@ -344,11 +344,11 @@ impl<Role> GrpcSession<Role> {
     /// Whether the native connection can accept additional inbound bytes.
     pub fn want_read(&self) -> bool { self.failed.is_none() && match &self.native { Native::Client(s) => s.want_read(), Native::Server(s) => s.want_read() } }
     /// Whether native frames or partially written transport bytes need sending.
-    pub fn want_write(&self) -> bool { self.transport_offset < self.transport_pending.len() || self.streams.values().any(|s| s.pending_trailers.is_some() && s.outgoing.borrow().finished) || match &self.native { Native::Client(s) => s.want_write(), Native::Server(s) => s.want_write() } }
+    pub fn want_write(&self) -> bool { !self.transport_flushed || self.transport_offset < self.transport_pending.len() || self.streams.values().any(|s| s.pending_trailers.is_some() && s.outgoing.borrow().finished) || match &self.native { Native::Client(s) => s.want_write(), Native::Server(s) => s.want_write() } }
     /// The most restrictive peer GOAWAY boundary and its HTTP/2 error code.
     pub fn goaway_received(&self) -> Option<(i32, u32)> { self.slots.goaway() }
-    /// Whether DATA and pending trailers have drained; reclamation still waits for native closure.
-    pub fn stream_outbound_complete(&self, id: i32) -> bool { self.streams.get(&id).is_some_and(|s| s.closed || (s.outgoing.borrow().finished && s.pending_trailers.is_none())) }
+    /// Whether terminal output was serialized and tracked transport writes/flushes drained.
+    pub fn stream_outbound_complete(&self, id: i32) -> bool { self.transport_flushed && self.transport_offset == self.transport_pending.len() && self.streams.get(&id).is_some_and(|s| s.closed || s.end_stream_serialized) }
     /// Whether local or peer GOAWAY has stopped admission of new RPCs.
     pub fn is_draining(&self) -> bool { self.draining || self.slots.goaway().is_some() }
     fn client(&self) -> bool { matches!(self.native, Native::Client(_)) }
@@ -375,7 +375,7 @@ impl<Role> GrpcSession<Role> {
                 encoding: CompressionAlgorithm::Identity,
                 outgoing_encoding: encoding,
                 outgoing: queue,
-                headers: vec![], header_bytes: 0, initial: false, sent_initial: false, terminal: false, closed: false,
+                headers: vec![], header_bytes: 0, initial: false, sent_initial: false, terminal: false, closed: false, end_stream_serialized: false,
                 failure: None, failure_taken: false, http_status: 200, pending_trailers: None,
                 prefix: vec![], remaining: 0, reserved: 0,
             },
@@ -420,10 +420,12 @@ impl<Role> GrpcSession<Role> {
         self.resume(id)
     }
     /// Resets a stream and releases its queued outbound body.
+    /// Completed NO_ERROR peer closure needs no additional local upload reset.
     /// # Errors
     /// Rejects unknown streams or native reset submission failure.
     pub fn cancel_stream(&mut self, id: i32, error_code: u32) -> Result<(), Status> {
         self.check_read(id)?;
+        if error_code == 0 && self.streams.get(&id).is_some_and(|s| s.closed && s.terminal) { return Ok(()); }
         native!(self, submit_rst_stream(id, error_code)).map_err(internal)?;
         self.fail_stream(id, Status::cancelled("stream cancelled"), error_code)
     }
@@ -489,6 +491,7 @@ impl<Role> GrpcSession<Role> {
             if self.transport_offset == self.transport_pending.len() {
                 self.transport_pending = self.mem_send()?.to_vec();
                 self.transport_offset = 0;
+                if !self.transport_pending.is_empty() { self.transport_flushed = false; }
                 if self.transport_pending.is_empty() {
                     break;
                 }
@@ -502,8 +505,8 @@ impl<Role> GrpcSession<Role> {
             }
         }
         match transport.flush() {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Ok(()) => { self.transport_flushed = true; Ok(()) },
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { self.transport_flushed = false; Ok(()) },
             Err(e) => Err(Status::unavailable(e.to_string())),
         }
     }
@@ -614,6 +617,9 @@ impl<Role> GrpcSession<Role> {
     }
     fn event(&mut self, event: SessionEvent) -> Result<(), Status> {
         match event {
+            SessionEvent::FrameSend { stream_id, frame_type, flags } if flags & 1 != 0 && matches!(frame_type, FrameType::HEADERS | FrameType::DATA) => {
+                if let Some(stream) = self.streams.get_mut(&stream_id) { stream.end_stream_serialized = true; }
+            }
             SessionEvent::BeginHeaders { stream_id: id, .. } => {
                 if !self.streams.contains_key(&id) {
                     if self.client() { return Err(Status::internal("unsolicited server stream")); }
@@ -783,7 +789,7 @@ impl<Role> GrpcSession<Role> {
             let retained = self.slots.get(id).map_or(0, |s| s.buffered_bytes());
             let remaining = self.stream_mut(id)?.reserved;
             let available = budget.saturating_sub(retained).saturating_sub(remaining).saturating_sub(5 + std::mem::size_of::<StreamMessage>());
-            let config = CompressionConfig { algorithm: encoding, max_decoding_message_size: self.config.max_inbound_message_size.min(available), ..self.config.compression };
+            let config = CompressionConfig { algorithm: encoding, max_decoding_message_size: self.config.compression.max_decoding_message_size.min(self.config.max_inbound_message_size).min(available), ..self.config.compression };
             let payload = config.decompress(frame.payload(), frame.is_compressed())?;
             self.slots.push_message(id, StreamMessage { compressed: false, payload }).map_err(slot_error)?;
         }
