@@ -1,0 +1,67 @@
+name: grpc-rs CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RUST_TEST_THREADS: '1'
+
+jobs:
+  ci:
+    name: Unified Incremental CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check runner isolation
+        run: bash .github/scripts/check-runner-isolation.sh
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake pkg-config libclang-dev libnghttp2-dev protobuf-compiler capnproto
+          python3 -c 'import tomllib'
+
+      - name: Put Rust on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        run: bash .github/scripts/install-rust-toolchain.sh
+
+      - name: Run workspace and codec gates
+        run: bash .github/scripts/ci-incremental.sh
+
+      - name: Remove this run's temporary files
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          root = Path(os.environ['RUNNER_TEMP']).resolve()
+          owned = os.environ.get('GRPC_CI_RUN_DIR')
+          if owned:
+              path = Path(owned)
+              if path.is_symlink() or path.resolve().parent != root or not path.name.startswith('grpc-rs-ci.'):
+                  raise SystemExit('Refusing to remove an unowned CI directory')
+              shutil.rmtree(path, ignore_errors=False)
+          PY
