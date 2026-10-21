@@ -40,17 +40,12 @@ fn metadata() -> Metadata {
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_lifecycle_unary_metadata_alignment_and_trailers() -> Result<(), Status> {
     let (mut client, mut server) = pair()?;
+    assert!(client.want_read() && client.want_write());
     let headers = metadata();
-    let id = client.start_request(
-        "localhost",
-        "/example.Echo/Call",
-        &headers,
-        Some(Duration::from_millis(123)),
-        Encoding::Identity,
-        false,
-    )?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &headers, Some(Duration::from_millis(123)), Encoding::Identity, false)?;
     client.send_message(id, b"request", Encoding::Identity)?;
     client.half_close(id)?;
     exchange(&mut client, &mut server)?;
@@ -75,10 +70,16 @@ fn integration_lifecycle_unary_metadata_alignment_and_trailers() -> Result<(), S
     assert_eq!(status, Status::new(Code::Ok, "done % 日本語"));
     assert_eq!(trailing, headers);
     assert!(client.is_remote_end_stream(id)?);
+    server.submit_goaway(0)?;
+    assert!(server.is_draining());
+    exchange(&mut client, &mut server)?;
+    assert_eq!(client.goaway_received(), Some((id, 0)));
+    assert!(client.is_draining() && !server.want_write());
     Ok(())
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_scenario_streaming_compression_and_interleaved_streams() -> Result<(), Status> {
     let (mut client, mut server) = pair()?;
     let encodings = [
@@ -91,14 +92,7 @@ fn integration_scenario_streaming_compression_and_interleaved_streams() -> Resul
     ];
     let mut ids = Vec::new();
     for &encoding in &encodings {
-        let id = client.start_request(
-            "localhost",
-            "/example.Echo/Stream",
-            &Metadata::new(),
-            None,
-            encoding,
-            false,
-        )?;
+        let id = client.start_request("localhost", "/example.Echo/Stream", &Metadata::new(), None, encoding, false)?;
         client.send_message(id, b"tiny", encoding)?;
         ids.push(id);
     }
@@ -222,19 +216,13 @@ fn integration_scenario_stream_limits_and_outbound_lifecycle() -> Result<(), Sta
     Ok(())
 }
 
-fn raw_pair() -> Result<(GrpcClientSession, nghttp2::ServerSession, i32), Box<dyn std::error::Error>>
+#[rustfmt::skip]
+fn raw_pair(end_stream: bool) -> Result<(GrpcClientSession, nghttp2::ServerSession, i32), Box<dyn std::error::Error>>
 {
     let mut client = GrpcClientSession::new(SessionConfig::default())?;
     let mut server = nghttp2::ServerSession::new_default(None, None)?;
     server.submit_settings(&[])?;
-    let id = client.start_request(
-        "localhost",
-        "/example.Echo/Call",
-        &Metadata::new(),
-        None,
-        Encoding::Identity,
-        true,
-    )?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, end_stream)?;
     for _ in 0..16 {
         let data = client.mem_send()?.to_vec();
         if data.is_empty() {
@@ -273,7 +261,7 @@ fn integration_scenario_http_fallback_without_grpc_status() -> Result<(), Box<dy
         (500, Code::Unknown),
         (200, Code::Unknown),
     ] {
-        let (mut client, mut server, id) = raw_pair()?;
+        let (mut client, mut server, id) = raw_pair(true)?;
         let status = http.to_string();
         server.submit_response(
             id,
@@ -296,7 +284,7 @@ fn integration_scenario_http_fallback_without_grpc_status() -> Result<(), Box<dy
 #[test]
 fn integration_scenario_trailers_only_canonical_status_overrides_http_fallback()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (mut client, mut server, id) = raw_pair()?;
+    let (mut client, mut server, id) = raw_pair(true)?;
     server.submit_response(
         id,
         &[
@@ -316,24 +304,11 @@ fn integration_scenario_trailers_only_canonical_status_overrides_http_fallback()
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_scenario_cancel_does_not_corrupt_other_streams() -> Result<(), Status> {
     let (mut client, mut server) = pair()?;
-    let a = client.start_request(
-        "localhost",
-        "/example.Echo/Cancel",
-        &Metadata::new(),
-        None,
-        Encoding::Identity,
-        false,
-    )?;
-    let b = client.start_request(
-        "localhost",
-        "/example.Echo/Keep",
-        &Metadata::new(),
-        None,
-        Encoding::Identity,
-        true,
-    )?;
+    let a = client.start_request("localhost", "/example.Echo/Cancel", &Metadata::new(), None, Encoding::Identity, false)?;
+    let b = client.start_request("localhost", "/example.Echo/Keep", &Metadata::new(), None, Encoding::Identity, true)?;
     exchange(&mut client, &mut server)?;
     assert_eq!(server.pop_incoming_request().expect("first").stream_id, a);
     assert_eq!(server.pop_incoming_request().expect("second").stream_id, b);
@@ -444,7 +419,7 @@ fn integration_scenario_missing_content_type_and_truncated_envelopes_fail_closed
         (b"application/grpc", &[0, 0, 0, 0, 3, b'a'][..]),
         (b"application/grpc", &[2, 0, 0, 0, 0][..]),
     ] {
-        let (mut client, mut server, id) = raw_pair()?;
+        let (mut client, mut server, id) = raw_pair(true)?;
         server.submit_response(
             id,
             &[
@@ -478,7 +453,7 @@ fn integration_scenario_missing_content_type_and_truncated_envelopes_fail_closed
 #[test]
 fn integration_scenario_received_goaway_keeps_accepted_stream_and_rejects_new_requests()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (mut client, mut server, id) = raw_pair()?;
+    let (mut client, mut server, id) = raw_pair(true)?;
     server.submit_goaway(id, 0, b"drain")?;
     deliver_raw(&mut client, &mut server)?;
     assert!(
@@ -610,6 +585,7 @@ fn integration_scenario_transport_short_writes_preserve_bytes_across_receive()
 }
 
 #[test]
+#[rustfmt::skip]
 fn integration_lifecycle_closed_slot_reclamation_reuses_capacity() -> Result<(), Status> {
     let config = SessionConfig {
         max_active_streams: 1,
@@ -618,14 +594,7 @@ fn integration_lifecycle_closed_slot_reclamation_reuses_capacity() -> Result<(),
     let mut client = GrpcClientSession::new(config.clone())?;
     let mut server = GrpcServerSession::new(config)?;
     for _ in 0..3 {
-        let id = client.start_request(
-            "localhost",
-            "/example.Echo/Call",
-            &Metadata::new(),
-            None,
-            Encoding::Identity,
-            true,
-        )?;
+        let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true)?;
         exchange(&mut client, &mut server)?;
         assert_eq!(
             server.pop_incoming_request().expect("request").stream_id,
@@ -720,5 +689,111 @@ fn integration_scenario_negotiated_encoding_mismatch_rejects_without_losing_pref
         b"accepted"
     );
     assert!(server.pop_message(id)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_lifecycle_reclamation_waits_for_native_trailer_serialization() -> Result<(), Status>
+{
+    let (mut client, mut server) = pair()?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true)?;
+    exchange(&mut client, &mut server)?;
+    server.send_message(id, b"retained", Encoding::Identity)?;
+    server.finish_response(id, &Status::new(Code::Ok, ""), &Metadata::new())?;
+    assert!(server.remove_closed_stream(id).is_err());
+    exchange(&mut client, &mut server)?;
+    assert_eq!(
+        client.pop_message(id)?.expect("body").payload(),
+        b"retained"
+    );
+    assert_eq!(
+        client.take_trailers(id)?.expect("trailers").0.code(),
+        Code::Ok
+    );
+    assert!(server.stream_outbound_complete(id));
+    server.remove_closed_stream(id)?;
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_lifecycle_zero_error_reset_closes_unfinished_server_request() -> Result<(), Status> {
+    let (mut client, mut server) = pair()?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, false)?;
+    exchange(&mut client, &mut server)?;
+    client.cancel_stream(id, 0)?;
+    exchange(&mut client, &mut server)?;
+    assert!(server.pop_incoming_request().is_none());
+    assert_ne!(
+        server.take_trailers(id)?.expect("reset status").0.code(),
+        Code::Ok
+    );
+    server.remove_closed_stream(id)?;
+    let (mut client, mut peer, id) = raw_pair(false).map_err(|e| Status::internal(e.to_string()))?;
+    peer.submit_rst_stream(id, 0).map_err(|e| Status::internal(e.to_string()))?;
+    deliver_raw(&mut client, &mut peer).map_err(|e| Status::internal(e.to_string()))?;
+    assert!(client.send_message(id, b"late", Encoding::Identity).is_err());
+    assert_eq!(client.take_trailers(id)?.expect("reset outcome").0.code(), Code::Unknown);
+    client.remove_closed_stream(id)?;
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_scenario_cancel_before_serialization_keeps_connection_usable() -> Result<(), Status> {
+    let (mut client, mut server) = pair()?;
+    let a = client.start_request("localhost", "/example.Echo/Cancel", &Metadata::new(), None, Encoding::Identity, false)?;
+    let b = client.start_request("localhost", "/example.Echo/Keep", &Metadata::new(), None, Encoding::Identity, true)?;
+    client.cancel_stream(a, 8)?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(server.pop_incoming_request().expect("surviving request").stream_id, b);
+    server.finish_response(b, &Status::new(Code::Ok, ""), &Metadata::new())?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(client.take_trailers(b)?.expect("completion").0.code(), Code::Ok);
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_scenario_informational_headers_do_not_replace_final_headers() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut client, mut server, id) = raw_pair(true)?;
+    server.submit_headers(0, id, &[nghttp2::HeaderField::new(b":status", b"100")])?;
+    deliver_raw(&mut client, &mut server)?;
+    assert!(client.pop_initial_metadata(id)?.is_none());
+    let body = grpc_core::AlignedMessageBuf::new(b"final body", false)?;
+    server.submit_response(id, &[nghttp2::HeaderField::new(b":status", b"200"), nghttp2::HeaderField::new(b"content-type", b"application/grpc")], Some(nghttp2::DataProvider::from_vec(body.wire_bytes().to_vec())))?;
+    deliver_raw(&mut client, &mut server)?;
+    assert_eq!(client.pop_message(id)?.expect("final body").payload(), b"final body");
+    assert_eq!(client.take_trailers(id)?.expect("missing status fallback").0.code(), Code::Unknown);
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_scenario_message_count_limit_is_resource_exhausted() -> Result<(), Status> {
+    let (mut client, mut server) = pair()?;
+    let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, false)?;
+    for _ in 0..1025 { client.send_message(id, b"", Encoding::Identity)?; }
+    client.half_close(id)?;
+    exchange(&mut client, &mut server)?;
+    assert_eq!(server.take_trailers(id)?.expect("queue limit").0.code(), Code::ResourceExhausted);
+    Ok(())
+}
+
+#[test]
+#[rustfmt::skip]
+fn integration_scenario_codec_content_types_are_advertised_and_received() -> Result<(), Status> {
+    for content_type in ["application/grpc+proto", "application/grpc+fory", "application/grpc+capnp"] {
+        let config = SessionConfig { content_type: content_type.into(), ..SessionConfig::default() };
+        let mut client = GrpcClientSession::new(config.clone())?;
+        let mut server = GrpcServerSession::new(config)?;
+        let id = client.start_request("localhost", "/example.Echo/Call", &Metadata::new(), None, Encoding::Identity, true)?;
+        exchange(&mut client, &mut server)?;
+        assert_eq!(server.pop_incoming_request().expect("typed request").content_type, content_type);
+        server.finish_response(id, &Status::new(Code::Ok, ""), &Metadata::new())?;
+        exchange(&mut client, &mut server)?;
+        assert_eq!(client.take_trailers(id)?.expect("typed response").0.code(), Code::Ok);
+    }
     Ok(())
 }
