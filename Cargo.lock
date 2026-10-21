@@ -127,6 +127,7 @@ name = "grpc-codec-fory"
 version = "0.1.0"
 dependencies = [
  "fory",
+ "grpc-core",
 ]
 
 [[package]]
