@@ -18,6 +18,7 @@ socket2 = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 rcgen = { workspace = true }
 
 

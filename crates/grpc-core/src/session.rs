@@ -677,7 +677,8 @@ impl<Role> GrpcSession<Role> {
                     self.incoming.retain(|r| r.stream_id != id);
                 }
             }
-            SessionEvent::FrameNotSend { stream_id, lib_error_code, .. } => {
+            // GOAWAY can discard queued connection control frames after the last RPC completes.
+            SessionEvent::FrameNotSend { stream_id, lib_error_code, .. } if stream_id != 0 || lib_error_code != nghttp2::sys::NGHTTP2_ERR_SESSION_CLOSING => {
                 return Err(Status::unavailable(format!("frame for {stream_id} rejected: {lib_error_code}")));
             }
             SessionEvent::Error { code, .. } => return Err(internal(code)),
