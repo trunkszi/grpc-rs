@@ -1,16 +1,70 @@
-//! Apache Fory payload serialization with a reusable, codec-owned context.
+//! Apache Fory payload serialization with reusable backend contexts.
 //!
 //! Register all message types on a [`backend::Fory`] before passing it to
 //! [`ForyCodec::with_fory`]. Registration IDs, schemas and Fory configuration
 //! must agree with the peer. Fory freezes registration on the first operation.
 //! gRPC framing, compression and transport message limits are handled separately.
 
-use std::marker::PhantomData;
+use std::{cell::Cell, marker::PhantomData, sync::OnceLock};
 
 /// Serialization backend, including schema derives and registration APIs.
 pub use fory as backend;
 use fory::{Fory, Reader, Serializer};
 use grpc_core::Codec;
+
+static DEFAULT_FORY: OnceLock<Fory> = OnceLock::new();
+
+thread_local! {
+    static OPERATION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static DEFAULT_POISONED: Cell<bool> = const { Cell::new(false) };
+}
+
+enum Backend {
+    SharedDefault,
+    Configured(Box<Fory>),
+}
+
+impl Backend {
+    fn instance(&self) -> &Fory {
+        match self {
+            Self::SharedDefault => DEFAULT_FORY.get_or_init(|| Fory::builder().build()),
+            Self::Configured(fory) => fory,
+        }
+    }
+}
+
+struct OperationGuard {
+    shared_default: bool,
+    completed: bool,
+}
+
+impl OperationGuard {
+    fn enter(shared_default: bool) -> Result<Self, backend::Error> {
+        if shared_default && DEFAULT_POISONED.get() {
+            return Err(backend::Error::invalid_data(
+                "default Fory context is poisoned by a serializer panic on this thread",
+            ));
+        }
+        if OPERATION_ACTIVE.replace(true) {
+            return Err(backend::Error::invalid_data(
+                "recursive Fory codec operation is unsupported",
+            ));
+        }
+        Ok(Self {
+            shared_default,
+            completed: false,
+        })
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if self.shared_default && !self.completed {
+            DEFAULT_POISONED.set(true);
+        }
+        OPERATION_ACTIVE.set(false);
+    }
+}
 
 /// Encodes with serializer `E` and decodes with serializer `D`.
 ///
@@ -44,7 +98,7 @@ use grpc_core::Codec;
 /// # Ok::<(), grpc_codec_fory::backend::Error>(())
 /// ```
 pub struct ForyCodec<E, D = E> {
-    fory: Fory,
+    fory: Backend,
     message_types: PhantomData<fn(E) -> D>,
 }
 
@@ -54,9 +108,16 @@ impl<E, D> ForyCodec<E, D> {
 
     /// Creates a codec using Fory's default configuration and built-in types.
     ///
+    /// All default codecs share one immutable backend, retaining at most one
+    /// read and write context per thread across repeated creation and dropping.
+    /// A serializer panic poisons default operations on that thread permanently;
+    /// subsequent operations return an error without reentering dirty contexts.
     /// Use [`Self::with_fory`] for registered structures or custom serializers.
     pub fn new() -> Self {
-        Self::with_fory(Fory::builder().build())
+        Self {
+            fory: Backend::SharedDefault,
+            message_types: PhantomData,
+        }
     }
 
     /// Takes ownership of a configured Fory instance with completed registrations.
@@ -66,10 +127,12 @@ impl<E, D> ForyCodec<E, D> {
     /// by the backend. Custom serializers must not recursively invoke backend
     /// serialization or deserialization while using a supplied context. Discard
     /// the codec if a serializer panics; backend context recovery applies to
-    /// errors returned as `Result`, not unwinding.
+    /// errors returned as `Result`, not unwinding. The backend retains configured
+    /// instances' contexts until thread exit, so reuse configured codecs rather
+    /// than repeatedly constructing them on a long-lived thread.
     pub fn with_fory(fory: Fory) -> Self {
         Self {
-            fory,
+            fory: Backend::Configured(Box::new(fory)),
             message_types: PhantomData,
         }
     }
@@ -96,14 +159,20 @@ impl<E: Serializer, D: Serializer> Codec for ForyCodec<E, D> {
         // The backend's borrowed-buffer writer is not detached if a custom
         // serializer panics. Its owned writer keeps cleanup independent of the
         // caller's Vec; only successfully serialized payloads are appended.
-        let payload = self.fory.serialize_with::<E>(item)?;
+        let mut guard = OperationGuard::enter(matches!(self.fory, Backend::SharedDefault))?;
+        let result = self.fory.instance().serialize_with::<E>(item);
+        guard.completed = true;
+        let payload = result?;
         destination.extend_from_slice(&payload);
         Ok(())
     }
 
     fn decode(&mut self, payload: &[u8]) -> Result<Self::DecodeItem, Self::Error> {
         let mut reader = Reader::new(payload);
-        let message = self.fory.deserialize_from_with::<D>(&mut reader)?;
+        let mut guard = OperationGuard::enter(matches!(self.fory, Backend::SharedDefault))?;
+        let result = self.fory.instance().deserialize_from_with::<D>(&mut reader);
+        guard.completed = true;
+        let message = result?;
         if reader.get_cursor() != payload.len() {
             return Err(backend::Error::invalid_data(
                 "trailing bytes after Fory gRPC message",
@@ -118,6 +187,126 @@ mod tests {
     use backend::ForyStruct;
 
     use super::*;
+
+    struct DefaultProbeSerializer;
+
+    impl Serializer for DefaultProbeSerializer {
+        type Target = i32;
+
+        fn write_data(
+            value: &i32,
+            context: &mut backend::WriteContext,
+        ) -> Result<(), backend::Error> {
+            i32::write_data(value, context)?;
+            assert!(*value >= 0, "default writer panic");
+            if *value == 42 {
+                let mut nested = ForyCodec::<i32>::new();
+                let error = nested.encode(&1, &mut Vec::new()).unwrap_err();
+                assert!(error.to_string().contains("recursive"));
+            }
+            Ok(())
+        }
+
+        fn read_data(context: &mut backend::ReadContext) -> Result<i32, backend::Error> {
+            let value = i32::read_data(context)?;
+            assert!(value >= 0, "default reader panic");
+            Ok(value)
+        }
+
+        fn write_type_info(context: &mut backend::WriteContext) -> Result<(), backend::Error> {
+            i32::write_type_info(context)
+        }
+
+        fn read_type_info(context: &mut backend::ReadContext) -> Result<(), backend::Error> {
+            i32::read_type_info(context)
+        }
+    }
+
+    #[test]
+    fn unit_scenario_default_backend_reused_across_types_lifetimes_and_threads() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<ForyCodec<String>>();
+        let anchor = ForyCodec::<i32>::new();
+        for _ in 0..256 {
+            let mut codec = ForyCodec::<String>::new();
+            assert!(std::ptr::eq(anchor.fory.instance(), codec.fory.instance()));
+            let mut bytes = Vec::new();
+            codec
+                .encode(&"reused backend".to_owned(), &mut bytes)
+                .unwrap();
+            assert!(codec.decode(&[]).is_err());
+            assert_eq!(codec.decode(&bytes).unwrap(), "reused backend");
+        }
+        std::thread::spawn(move || {
+            let mut moved = anchor;
+            let local = ForyCodec::<String>::new();
+            assert!(std::ptr::eq(moved.fory.instance(), local.fory.instance()));
+            let mut bytes = Vec::new();
+            moved.encode(&17, &mut bytes).unwrap();
+            assert_eq!(moved.decode(&bytes).unwrap(), 17);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn unit_scenario_recursive_default_codec_rejected_without_poisoning_context() {
+        let mut codec = ForyCodec::<DefaultProbeSerializer>::new();
+        let mut bytes = Vec::new();
+        codec.encode(&42, &mut bytes).unwrap();
+        assert_eq!(codec.decode(&bytes).unwrap(), 42);
+        bytes.clear();
+        codec.encode(&17, &mut bytes).unwrap();
+        assert_eq!(codec.decode(&bytes).unwrap(), 17);
+    }
+
+    #[test]
+    fn unit_scenario_default_serializer_panic_poison_is_thread_local_and_permanent() {
+        for decoding in [false, true] {
+            std::thread::spawn(move || {
+                let mut ordinary = ForyCodec::<i32>::new();
+                let mut negative = Vec::new();
+                ordinary.encode(&-1, &mut negative).unwrap();
+                let mut codec = ForyCodec::<DefaultProbeSerializer>::new();
+                let mut prefix = b"owned prefix".to_vec();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if decoding {
+                        codec.decode(&negative).unwrap();
+                    } else {
+                        codec.encode(&-1, &mut prefix).unwrap();
+                    }
+                }));
+                assert!(result.is_err());
+                assert_eq!(prefix, b"owned prefix");
+                drop(codec);
+                let mut replacement = ForyCodec::<i32>::new();
+                assert!(
+                    replacement
+                        .encode(&1, &mut prefix)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("poisoned")
+                );
+                assert!(
+                    ordinary
+                        .decode(&negative)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("poisoned")
+                );
+                std::thread::spawn(|| {
+                    let mut fresh = ForyCodec::<i32>::new();
+                    let mut bytes = Vec::new();
+                    fresh.encode(&7, &mut bytes).unwrap();
+                    assert_eq!(fresh.decode(&bytes).unwrap(), 7);
+                })
+                .join()
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+    }
 
     #[derive(Debug, PartialEq, ForyStruct)]
     struct Request {
@@ -264,7 +453,10 @@ mod tests {
             assert_eq!(codec.decode(&bytes).unwrap(), message);
         }
         // Registration is frozen by the existing instance's first operation.
-        assert!(codec.fory.register::<Request>(100).is_err());
+        let Backend::Configured(fory) = &mut codec.fory else {
+            panic!("expected configured backend");
+        };
+        assert!(fory.register::<Request>(100).is_err());
         let mut moved = Box::new(codec);
         assert_eq!(moved.decode(&bytes).unwrap(), request(31, "cached schema"));
     }
