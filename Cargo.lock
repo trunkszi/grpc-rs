@@ -170,6 +170,7 @@ name = "grpc-codec-capnp"
 version = "0.1.0"
 dependencies = [
  "capnp",
+ "grpc-core",
 ]
 
 [[package]]
@@ -184,6 +185,7 @@ dependencies = [
 name = "grpc-codec-prost"
 version = "0.1.0"
 dependencies = [
+ "grpc-core",
  "prost",
 ]
 
