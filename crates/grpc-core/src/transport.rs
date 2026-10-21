@@ -53,6 +53,8 @@ struct MemoryBuffer {
     capacity: usize,
     reader_alive: bool,
     writer_alive: bool,
+    #[cfg(test)]
+    wait_entered: Option<std::sync::mpsc::Sender<()>>,
 }
 
 struct MemoryLane {
@@ -72,6 +74,8 @@ impl MemoryLane {
                 capacity,
                 reader_alive: true,
                 writer_alive: true,
+                #[cfg(test)]
+                wait_entered: None,
             }),
             changed: Condvar::new(),
         })
@@ -88,6 +92,11 @@ impl MemoryLane {
         guard: MutexGuard<'a, MemoryBuffer>,
         deadline: Option<Instant>,
     ) -> io::Result<MutexGuard<'a, MemoryBuffer>> {
+        // Signal under the buffer lock; tests acquire it to confirm wait entry.
+        #[cfg(test)]
+        if let Some(entered) = guard.wait_entered.as_ref() {
+            entered.send(()).map_err(io::Error::other)?;
+        }
         if let Some(deadline) = deadline {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -575,12 +584,6 @@ mod tests {
         result.err().map(|error| error.kind())
     }
 
-    fn joined<T>(thread: std::thread::JoinHandle<io::Result<T>>) -> io::Result<T> {
-        thread
-            .join()
-            .map_err(|_| io::Error::other("worker panicked"))?
-    }
-
     #[test]
     fn memory_full_duplex_and_eof() -> io::Result<()> {
         let (mut first, mut second) = MemoryPipe::pair();
@@ -602,7 +605,6 @@ mod tests {
         assert_eq!(second.write(&[])?, 0);
         Ok(())
     }
-
     #[test]
     fn memory_nonblocking_capacity_and_wraparound() -> io::Result<()> {
         let (mut first, mut second) = MemoryPipe::with_capacity(3)?;
@@ -624,7 +626,6 @@ mod tests {
         assert!(MemoryPipe::with_capacity(isize::MAX as usize).is_err());
         Ok(())
     }
-
     #[test]
     fn memory_timeouts_and_validation() -> io::Result<()> {
         let (mut first, _second) = MemoryPipe::with_capacity(1)?;
@@ -643,48 +644,60 @@ mod tests {
         first.set_write_timeout(None)?;
         Ok(())
     }
-
     #[test]
-    fn memory_blocking_reader_wakes_on_data_and_drop() -> io::Result<()> {
-        let (mut first, mut second) = MemoryPipe::pair();
-        first.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            first.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        });
-        second.write_all(b"wake")?;
-        drop(second);
-        assert_eq!(joined(reader)?, b"wake");
+    fn memory_blocked_operations_wake_on_peer_progress_and_drop() -> io::Result<()> {
+        for case in 0..4 {
+            let (mut first, mut second) = MemoryPipe::with_capacity(1)?;
+            first.set_read_timeout(Some(Duration::from_secs(5)))?;
+            first.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let writing = case >= 2;
+            let lane = Arc::clone([&first.incoming, &first.outgoing][usize::from(writing)]);
+            if writing {
+                first.write_all(b"a")?;
+            }
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            lane.lock()?.wait_entered = Some(entered_tx);
+            let worker = std::thread::spawn(move || {
+                let mut byte = [0];
+                let result = if writing {
+                    first.write(b"b")
+                } else {
+                    first.read(&mut byte)
+                };
+                done_tx.send((result, byte)).map_err(io::Error::other)
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(io::Error::other)?;
+            // The worker signals with the guard held; acquiring it proves wait entry.
+            drop(lane.lock()?);
+            match case {
+                0 => second.write_all(b"b")?,
+                1 | 3 => drop(second),
+                _ => second.read_exact(&mut [0])?,
+            }
+            // This deadline precedes the I/O deadline, so timeout rechecks cannot pass.
+            let completed = done_rx.recv_timeout(Duration::from_secs(2));
+            if completed.is_err() {
+                lane.changed.notify_all(); // Release the worker before reporting failure.
+            }
+            worker
+                .join()
+                .map_err(|_| io::Error::other("worker panicked"))??;
+            let (result, byte) = completed.map_err(io::Error::other)?;
+            match case {
+                0 => {
+                    assert_eq!(result?, 1);
+                    assert_eq!(&byte, b"b");
+                }
+                1 => assert_eq!(result?, 0),
+                2 => assert_eq!(result?, 1),
+                _ => assert_eq!(error_kind(result), Some(BrokenPipe)),
+            }
+        }
         Ok(())
     }
-
-    #[test]
-    fn memory_blocking_writer_wakes_on_read() -> io::Result<()> {
-        let (mut first, mut second) = MemoryPipe::with_capacity(1)?;
-        first.set_write_timeout(Some(Duration::from_secs(5)))?;
-        second.set_read_timeout(Some(Duration::from_secs(5)))?;
-        first.write_all(b"a")?;
-        let writer = std::thread::spawn(move || -> io::Result<()> { first.write_all(b"bc") });
-        let mut bytes = [0; 3];
-        second.read_exact(&mut bytes)?;
-        joined(writer)?;
-        assert_eq!(&bytes, b"abc");
-        Ok(())
-    }
-
-    #[test]
-    fn memory_blocking_writer_wakes_on_peer_drop() -> io::Result<()> {
-        let (mut first, second) = MemoryPipe::with_capacity(1)?;
-        first.set_write_timeout(Some(Duration::from_secs(5)))?;
-        first.write_all(b"a")?;
-        let writer = std::thread::spawn(move || first.write(b"b"));
-        drop(second);
-        let result = joined(writer);
-        assert_eq!(error_kind(result), Some(BrokenPipe));
-        Ok(())
-    }
-
     #[test]
     fn tcp_loopback_enables_nodelay_and_transfers_both_directions() -> io::Result<()> {
         let listener = TcpTransportListener::bind("127.0.0.1:0")?;
@@ -707,13 +720,9 @@ mod tests {
         client.read_exact(&mut reply)?;
         assert_eq!(&reply, b"reply");
         client.set_nonblocking(true)?;
-        assert_eq!(
-            client.read(&mut reply).expect_err("empty socket").kind(),
-            WouldBlock
-        );
+        assert_eq!(error_kind(client.read(&mut reply)), Some(WouldBlock));
         Ok(())
     }
-
     #[cfg(unix)]
     #[test]
     fn unix_socket_transfers_both_directions() -> io::Result<()> {
@@ -751,7 +760,6 @@ mod tests {
         assert_eq!(&buffer, b"pong");
         Ok(())
     }
-
     #[test]
     fn tcp_options_apply_buffers_keepalive_and_nonblocking() -> io::Result<()> {
         let listener = TcpTransportListener::bind("127.0.0.1:0")?;
@@ -768,15 +776,9 @@ mod tests {
         assert!(socket.send_buffer_size()? >= 8192);
         assert!(socket.recv_buffer_size()? >= 8192);
         assert!(client.get_ref().nodelay()?);
-        assert_eq!(
-            client.read(&mut [0]).expect_err("empty socket").kind(),
-            WouldBlock
-        );
+        assert_eq!(error_kind(client.read(&mut [0])), Some(WouldBlock));
         listener.set_nonblocking(true)?;
-        assert_eq!(
-            listener.accept().expect_err("empty accept queue").kind(),
-            WouldBlock
-        );
+        assert_eq!(error_kind(listener.accept()), Some(WouldBlock));
         Ok(())
     }
     #[test]
