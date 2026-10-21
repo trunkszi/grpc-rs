@@ -370,4 +370,41 @@ mod unit {
             Code::ResourceExhausted
         );
     }
+
+    #[test]
+    fn scenario_lifecycle_reset_discards_every_partial_frame() {
+        let abandoned = AlignedMessageBuf::new(b"abandoned", true).unwrap();
+        let replacement = AlignedMessageBuf::new(b"replacement", false).unwrap();
+        for end in 1..abandoned.wire_bytes().len() {
+            let mut decoder = LengthPrefixedFrame::default();
+            assert!(
+                decoder
+                    .push(&abandoned.wire_bytes()[..end])
+                    .unwrap()
+                    .is_empty()
+            );
+            decoder.reset();
+            let decoded = decoder.push(replacement.wire_bytes()).unwrap();
+            assert_eq!(decoded.len(), 1);
+            assert_aligned(&decoded[0], replacement.payload(), false);
+            decoder.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn scenario_failure_after_complete_message_rejects_entire_chunk() {
+        let valid = AlignedMessageBuf::new(b"valid", false).unwrap();
+        let mut chunk = valid.wire_bytes().to_vec();
+        chunk.extend_from_slice(&[2, 0, 0, 0, 0]);
+        let mut decoder = LengthPrefixedFrame::default();
+        let error = decoder.push(&chunk).unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(decoder.push(valid.wire_bytes()).unwrap_err(), error);
+        assert_eq!(decoder.finish().unwrap_err(), error);
+        decoder.reset();
+        let decoded = decoder.push(valid.wire_bytes()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_aligned(&decoded[0], valid.payload(), false);
+        decoder.finish().unwrap();
+    }
 }
