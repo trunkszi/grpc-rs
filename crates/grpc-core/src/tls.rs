@@ -621,4 +621,124 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn nonblocking_partial_records_and_close_notify_resume() -> io::Result<()> {
+        let (client_config, server_config) = configs()?;
+        let (client_pipe, server_pipe) = MemoryPipe::with_capacity(32)?;
+        let mut client = TlsTransport::<rustls::ClientConnection, _>::client(
+            client_pipe,
+            &client_config,
+            localhost()?,
+        )?;
+        let mut server =
+            TlsTransport::<rustls::ServerConnection, _>::server(server_pipe, &server_config)?;
+        client.set_nonblocking(true)?;
+        server.set_nonblocking(true)?;
+        for _ in 0..10000 {
+            for result in [client.handshake(), server.handshake()] {
+                if let Err(error) = result
+                    && error.kind() != io::ErrorKind::WouldBlock
+                {
+                    return Err(error);
+                }
+            }
+            if client.negotiated_alpn().is_some() && server.negotiated_alpn().is_some() {
+                break;
+            }
+        }
+        assert!(client.negotiated_alpn().is_some() && server.negotiated_alpn().is_some());
+        let (request, response) = ([b'a'; 4096], [b'b'; 4096]);
+        let (mut written, mut received) = ([0; 2], [Vec::new(), Vec::new()]);
+        let mut blocked = false;
+        for _ in 0..10000 {
+            for (index, transport, message) in [
+                (0, &mut client as &mut dyn SyncTransport, &request),
+                (1, &mut server as &mut dyn SyncTransport, &response),
+            ] {
+                if written[index] < message.len() {
+                    match transport.write(&message[written[index]..]) {
+                        Ok(count) => written[index] += count,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => blocked = true,
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Err(error) = transport.flush() {
+                    if error.kind() != io::ErrorKind::WouldBlock {
+                        return Err(error);
+                    }
+                    blocked = true;
+                }
+                let mut buffer = [0; 97];
+                match transport.read(&mut buffer) {
+                    Ok(count) => received[index].extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if received[0].len() == response.len() && received[1].len() == request.len() {
+                break;
+            }
+        }
+        assert!(
+            blocked,
+            "capacity must exercise partial encrypted record writes"
+        );
+        assert_eq!(received[0], response);
+        assert_eq!(received[1], request);
+        // Queue more than the wire capacity, then close with encrypted data pending.
+        client.write_all(b"abcdefghijklmnopqrstuvwxyz0123456789")?;
+        assert_eq!(
+            client.close_notify().err().map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        let mut tail = Vec::new();
+        let mut eof = false;
+        for _ in 0..10000 {
+            if let Err(error) = client.close_notify()
+                && error.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(error);
+            }
+            let mut buffer = [0; 97];
+            match server.read(&mut buffer) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => tail.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        assert!(eof, "close notification must eventually produce clean EOF");
+        assert_eq!(tail, b"abcdefghijklmnopqrstuvwxyz0123456789");
+        assert_eq!(
+            client.write(b"x").err().map(|e| e.kind()),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        server.write_all(b"ack")?;
+        let mut reply = Vec::new();
+        for _ in 0..1000 {
+            if let Err(error) = server.flush()
+                && error.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(error);
+            }
+            let mut buffer = [0; 3];
+            match client.read(&mut buffer) {
+                Ok(count) => reply.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if reply.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            reply, b"ack",
+            "write-close must preserve the read direction"
+        );
+        Ok(())
+    }
 }
