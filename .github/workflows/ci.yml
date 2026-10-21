@@ -17,6 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
   RUST_BACKTRACE: '1'
   RUST_TEST_THREADS: '1'
 
@@ -27,12 +28,41 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Check runner isolation
         run: bash .github/scripts/check-runner-isolation.sh
+
+      - name: Grant read access to nghttp2-rs
+        env:
+          NGHTTP2_RS_DEPLOY_KEY: ${{ secrets.NGHTTP2_RS_DEPLOY_KEY }}
+        run: |
+          if ! [ -n "${NGHTTP2_RS_DEPLOY_KEY:-}" ]; then
+            echo '::error::secret NGHTTP2_RS_DEPLOY_KEY is not set; cargo cannot fetch trunkszi/nghttp2-rs'
+            exit 1
+          fi
+          dir="$GRPC_CI_RUN_DIR/private-git-deps"
+          mkdir -p "$dir" && chmod 700 "$dir"
+          printf '%s\n' "$NGHTTP2_RS_DEPLOY_KEY" > "$dir/nghttp2-rs"
+          chmod 600 "$dir/nghttp2-rs"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$dir/known_hosts"
+          cat > "$dir/ssh_config" <<EOF
+          Host github-nghttp2-rs
+            HostName github.com
+            User git
+            IdentityFile $dir/nghttp2-rs
+            IdentitiesOnly yes
+            UserKnownHostsFile $dir/known_hosts
+            StrictHostKeyChecking yes
+          EOF
+          {
+            echo 'GIT_CONFIG_COUNT=1'
+            echo 'GIT_CONFIG_KEY_0=url.git@github-nghttp2-rs:trunkszi/nghttp2-rs.git.insteadOf'
+            echo 'GIT_CONFIG_VALUE_0=https://github.com/trunkszi/nghttp2-rs.git'
+            echo "GIT_SSH_COMMAND=ssh -F $dir/ssh_config"
+          } >> "$GITHUB_ENV"
 
       - name: Install native dependencies
         run: |
