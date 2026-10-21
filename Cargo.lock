@@ -176,6 +176,8 @@ dependencies = [
  "grpc-codec-prost",
  "grpc-core",
  "grpc-macros",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]
@@ -285,7 +287,7 @@ dependencies = [
 [[package]]
 name = "nghttp2"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#50ab91168c0d181333d8484794367a3f38cf1a1c"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#3bb4be49a6c168560086372566d397cbc39969d4"
 dependencies = [
  "nghttp2-macros",
  "nghttp2-sys",
@@ -294,7 +296,7 @@ dependencies = [
 [[package]]
 name = "nghttp2-macros"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#50ab91168c0d181333d8484794367a3f38cf1a1c"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#3bb4be49a6c168560086372566d397cbc39969d4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -304,7 +306,7 @@ dependencies = [
 [[package]]
 name = "nghttp2-sys"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#50ab91168c0d181333d8484794367a3f38cf1a1c"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#3bb4be49a6c168560086372566d397cbc39969d4"
 dependencies = [
  "cc",
  "cmake",

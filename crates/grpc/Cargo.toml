@@ -21,3 +21,16 @@ grpc-macros = { workspace = true }
 grpc-codec-prost = { workspace = true, optional = true }
 grpc-codec-fory = { workspace = true, optional = true }
 grpc-codec-capnp = { workspace = true, optional = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+
+[[example]]
+name = "hft_order_service"
+required-features = ["protobuf", "fory", "capnp"]
+
+[[bench]]
+name = "hft_rpc_bench"
+harness = false
+required-features = ["protobuf", "fory", "capnp"]
