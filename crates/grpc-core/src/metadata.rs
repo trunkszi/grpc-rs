@@ -16,7 +16,7 @@ use base64::{
 /// A validated ASCII value or an unencoded binary value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataValue {
-    /// Printable ASCII bytes, including spaces.
+    /// Printable ASCII bytes, with horizontal tabs accepted from incoming headers.
     Ascii(String),
     /// Raw bytes associated with a `-bin` key.
     Binary(Vec<u8>),
@@ -31,7 +31,7 @@ pub enum MetadataError {
     ReservedKey,
     /// A binary key was paired with ASCII data, or the reverse.
     ValueKindMismatch,
-    /// An ASCII value contains bytes outside `0x20..=0x7e`.
+    /// An ASCII value violates its incoming or outgoing character policy.
     InvalidAsciiValue,
     /// A binary header contains malformed Base64.
     InvalidBinaryValue,
@@ -45,7 +45,7 @@ impl fmt::Display for MetadataError {
             Self::InvalidKey => "metadata keys must be nonempty lowercase ASCII tokens",
             Self::ReservedKey => "the grpc- metadata prefix is reserved for the protocol",
             Self::ValueKindMismatch => "binary metadata requires a -bin key and raw bytes",
-            Self::InvalidAsciiValue => "ASCII metadata values must contain printable ASCII only",
+            Self::InvalidAsciiValue => "metadata values contain invalid ASCII characters",
             Self::InvalidBinaryValue => "binary metadata must contain valid standard Base64",
             Self::InvalidTimeout => "grpc-timeout requires up to eight digits and a supported unit",
         })
@@ -122,6 +122,7 @@ impl Metadata {
     }
 
     /// Decodes one application header, splitting comma-joined binary values.
+    /// Incoming ASCII values accept HTTP horizontal tabs as well as printable ASCII.
     ///
     /// # Errors
     /// Rejects reserved keys, invalid ASCII or Base64. Rejection is atomic even
@@ -129,7 +130,15 @@ impl Metadata {
     pub fn append_header(&mut self, key: &str, value: &str) -> Result<(), MetadataError> {
         validate_key(key)?;
         if !key.ends_with("-bin") {
-            return self.append_ascii(key, value);
+            if !value
+                .bytes()
+                .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+            {
+                return Err(MetadataError::InvalidAsciiValue);
+            }
+            self.entries
+                .push((key.to_owned(), MetadataValue::Ascii(value.to_owned())));
+            return Ok(());
         }
         let engine = GeneralPurpose::new(
             &alphabet::STANDARD,
@@ -289,6 +298,52 @@ mod unit_scenario {
             metadata.append_header("ascii", "bad\n"),
             Err(MetadataError::InvalidAsciiValue)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn incoming_tabs_preserve_values_and_outgoing_ascii_stays_strict() -> Result<(), MetadataError>
+    {
+        let mut metadata = Metadata::from_headers([("note", "a\tb")])?;
+        metadata.append_header("note", "\t c \t")?;
+        assert_eq!(
+            metadata.to_headers(),
+            vec![
+                ("note".to_owned(), "a\tb".to_owned()),
+                ("note".to_owned(), "\t c \t".to_owned()),
+            ]
+        );
+        let original = metadata.clone();
+        assert_eq!(
+            metadata.append_ascii("note", "a\tb"),
+            Err(MetadataError::InvalidAsciiValue)
+        );
+        assert_eq!(metadata, original);
+        Ok(())
+    }
+
+    #[test]
+    fn incoming_ascii_rejects_other_controls_atomically() -> Result<(), MetadataError> {
+        let mut metadata = Metadata::from_headers([("note", "retained")])?;
+        let original = metadata.clone();
+        for byte in (0_u8..=0x1f).chain([0x7f]).filter(|byte| *byte != b'\t') {
+            let value = format!("a{}b", char::from(byte));
+            assert_eq!(
+                metadata.append_header("note", &value),
+                Err(MetadataError::InvalidAsciiValue),
+                "control {byte:#x}"
+            );
+            assert_eq!(metadata, original);
+            assert_eq!(
+                Metadata::from_headers([("note", value.as_str())]),
+                Err(MetadataError::InvalidAsciiValue)
+            );
+        }
+        assert_eq!(
+            metadata.append_header("note", "non-ASCII é"),
+            Err(MetadataError::InvalidAsciiValue)
+        );
+        assert_eq!(metadata, original);
         Ok(())
     }
 

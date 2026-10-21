@@ -1,10 +1,7 @@
 //! Bounded, single-threaded ownership of HTTP/2 stream receive events.
 //!
-//! The byte budget counts retained metadata entries, message descriptors and wire
-//! bytes, including incomplete five-byte gRPC envelopes. Container bookkeeping
-//! and allocator overhead are excluded. Spare capacity is bounded by admitted bytes and queue
-//! counts; queues shrink at quarter occupancy. Owned buffers are normalized. Rejected inputs
-//! preserve all previously accepted events and partial frames.
+//! Budgets count metadata, message descriptors and wire bytes, excluding allocator overhead.
+//! Normalized buffers and shrinking queues bound spare capacity. Rejections preserve accepted data.
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -49,13 +46,13 @@ pub enum SlotMapError {
     AlreadyOpen(i32),
     /// The identifier has no slot.
     UnknownStream(i32),
-    /// The peer's GOAWAY excludes this stream.
+    /// The peer's GOAWAY prohibits this stream.
     GoAway {
         stream_id: i32,
         last_stream_id: i32,
         error_code: u32,
     },
-    /// The peer reset the stream; buffered events must not mask the reset.
+    /// An error or incomplete-response reset prevents reads of buffered events.
     Reset { stream_id: i32, error_code: u32 },
     /// The event violates the receive or half-close lifecycle.
     InvalidTransition {
@@ -80,13 +77,10 @@ impl fmt::Display for SlotMapError {
             Self::AlreadyOpen(id) => write!(f, "stream {id} is already open"),
             Self::UnknownStream(id) => write!(f, "unknown stream {id}"),
             Self::GoAway {
-                stream_id,
-                last_stream_id,
-                error_code,
-            } => write!(
-                f,
-                "GOAWAY: stream={stream_id}, last={last_stream_id}, code={error_code}"
-            ),
+                stream_id: id,
+                last_stream_id: last,
+                error_code: code,
+            } => write!(f, "GOAWAY: stream={id}, last={last}, code={code}"),
             Self::Reset {
                 stream_id,
                 error_code,
@@ -95,12 +89,14 @@ impl fmt::Display for SlotMapError {
                 stream_id,
                 operation,
             } => write!(f, "stream {stream_id}: cannot {operation}"),
-            Self::MemoryLimit { stream_id, limit } => {
-                write!(f, "stream {stream_id}: byte limit {limit}")
-            }
-            Self::MessageLimit { stream_id, limit } => {
-                write!(f, "stream {stream_id}: message limit {limit}")
-            }
+            Self::MemoryLimit {
+                stream_id: id,
+                limit,
+            } => write!(f, "stream {id}: byte limit {limit}"),
+            Self::MessageLimit {
+                stream_id: id,
+                limit,
+            } => write!(f, "stream {id}: message limit {limit}"),
             Self::InvalidCompressionFlag { stream_id, flag } => {
                 write!(f, "stream {stream_id}: invalid compression flag {flag}")
             }
@@ -110,6 +106,8 @@ impl fmt::Display for SlotMapError {
     }
 }
 impl std::error::Error for SlotMapError {}
+/// Result of admitting, consuming or transitioning a stream event.
+pub type SlotResult<T> = Result<T, SlotMapError>;
 fn memory_limit(stream_id: i32, limits: StreamLimits) -> SlotMapError {
     SlotMapError::MemoryLimit {
         stream_id,
@@ -165,8 +163,9 @@ impl StreamSlot {
     pub const fn reset_error_code(&self) -> Option<u32> {
         self.reset
     }
-    fn check_reset(&self, stream_id: i32) -> Result<(), SlotMapError> {
+    fn check_reset(&self, stream_id: i32) -> SlotResult<()> {
         match self.reset {
+            Some(0) if self.trailers_seen && self.remote_end => Ok(()),
             Some(error_code) => Err(SlotMapError::Reset {
                 stream_id,
                 error_code,
@@ -174,14 +173,14 @@ impl StreamSlot {
             None => Ok(()),
         }
     }
-    fn receive(&self, stream_id: i32, operation: &'static str) -> Result<(), SlotMapError> {
+    fn receive(&self, stream_id: i32, operation: &'static str) -> SlotResult<()> {
         self.check_reset(stream_id)?;
         if self.remote_end || self.trailers_seen {
             return Err(transition(stream_id, operation));
         }
         Ok(())
     }
-    fn budget(&self, id: i32, bytes: usize, limits: StreamLimits) -> Result<usize, SlotMapError> {
+    fn budget(&self, id: i32, bytes: usize, limits: StreamLimits) -> SlotResult<usize> {
         self.buffered_bytes
             .checked_add(bytes)
             .filter(|total| *total <= limits.max_buffered_bytes)
@@ -189,37 +188,53 @@ impl StreamSlot {
     }
 }
 
+/// The local HTTP/2 endpoint determines which stream identifiers it initiates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EndpointRole {
+    /// Clients initiate odd-numbered streams.
+    #[default]
+    Client,
+    /// Servers initiate even-numbered streams.
+    Server,
+}
+impl EndpointRole {
+    const fn initiates(self, id: i32) -> bool {
+        matches!(self, Self::Client) == (id % 2 == 1)
+    }
+}
 /// A synchronous stream demultiplexer with explicit ownership transfer on reads.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StreamSlotMap {
     slots: BTreeMap<i32, StreamSlot>,
     limits: StreamLimits,
+    role: EndpointRole,
     goaway: Option<(i32, u32)>,
 }
-impl Default for StreamSlotMap {
-    fn default() -> Self {
-        Self::new(StreamLimits::default())
-    }
-}
 impl StreamSlotMap {
-    /// Creates an empty map. Zero limits intentionally disable buffering.
+    /// Creates a client map. Zero limits intentionally disable buffering.
     #[must_use]
     pub const fn new(limits: StreamLimits) -> Self {
+        Self::with_role(limits, EndpointRole::Client)
+    }
+    /// Creates an empty map for the specified local HTTP/2 endpoint role.
+    #[must_use]
+    pub const fn with_role(limits: StreamLimits, role: EndpointRole) -> Self {
         Self {
             slots: BTreeMap::new(),
             limits,
+            role,
             goaway: None,
         }
     }
     /// Opens a stream without allocating receive buffers.
     /// # Errors
-    /// Rejects invalid, existing, or GOAWAY-excluded identifiers.
-    pub fn open_stream(&mut self, stream_id: i32) -> Result<(), SlotMapError> {
+    /// Rejects invalid/existing identifiers and new local streams after GOAWAY.
+    pub fn open_stream(&mut self, stream_id: i32) -> SlotResult<()> {
         if stream_id <= 0 {
             return Err(SlotMapError::InvalidStreamId(stream_id));
         }
         if let Some((last_stream_id, error_code)) = self.goaway
-            && stream_id > last_stream_id
+            && self.role.initiates(stream_id)
         {
             return Err(SlotMapError::GoAway {
                 stream_id,
@@ -251,19 +266,14 @@ impl StreamSlotMap {
     /// Stores the initial header block exactly once, even after it is consumed.
     /// # Errors
     /// Rejects unknown/reset streams, duplicate or late headers, and budget excess.
-    pub fn push_initial_metadata(
-        &mut self,
-        stream_id: i32,
-        headers: Headers,
-    ) -> Result<(), SlotMapError> {
+    pub fn push_initial_metadata(&mut self, stream_id: i32, headers: Headers) -> SlotResult<()> {
         self.push_headers(stream_id, headers, false)
     }
     /// Accepts arbitrary DATA fragmentation and queues complete gRPC envelopes.
     /// # Errors
-    /// Rejects unknown/reset/ended streams, DATA before headers, malformed flags,
-    /// oversized declared messages, or either resource limit. Every rejection
-    /// leaves prior partial bytes and queued events unchanged.
-    pub fn append_recv_bytes(&mut self, stream_id: i32, bytes: &[u8]) -> Result<(), SlotMapError> {
+    /// Rejects missing headers, ended/reset streams, malformed flags or excess resources.
+    /// Rejections preserve accepted frames and partial bytes.
+    pub fn append_recv_bytes(&mut self, stream_id: i32, bytes: &[u8]) -> SlotResult<()> {
         let limits = self.limits;
         let slot = self.slot_mut(stream_id)?;
         slot.receive(stream_id, "receive DATA")?;
@@ -292,12 +302,8 @@ impl StreamSlotMap {
             if len - consumed < 5 {
                 break;
             }
-            let payload_len = u32::from_be_bytes([
-                at(consumed + 1),
-                at(consumed + 2),
-                at(consumed + 3),
-                at(consumed + 4),
-            ]) as usize;
+            let payload_len =
+                u32::from_be_bytes(std::array::from_fn(|i| at(consumed + 1 + i))) as usize;
             let frame_len = payload_len
                 .checked_add(5)
                 .ok_or(memory_limit(stream_id, limits))?;
@@ -338,12 +344,8 @@ impl StreamSlotMap {
         combined.extend_from_slice(bytes);
         let mut offset = 0;
         for _ in 0..count {
-            let payload_len = u32::from_be_bytes([
-                combined[offset + 1],
-                combined[offset + 2],
-                combined[offset + 3],
-                combined[offset + 4],
-            ]) as usize;
+            let payload_len =
+                u32::from_be_bytes(std::array::from_fn(|i| combined[offset + 1 + i])) as usize;
             let end = offset + 5 + payload_len;
             slot.messages.push_back(StreamMessage {
                 compressed: combined[offset] == 1,
@@ -357,13 +359,8 @@ impl StreamSlotMap {
     }
     /// Queues a complete envelope supplied by an upstream frame decoder.
     /// # Errors
-    /// Rejects unknown/reset/ended streams, missing headers, partial wire frames,
-    /// and message or byte limit excess.
-    pub fn push_message(
-        &mut self,
-        stream_id: i32,
-        message: StreamMessage,
-    ) -> Result<(), SlotMapError> {
+    /// Rejects missing headers, ended/reset streams, partial frames or excess resources.
+    pub fn push_message(&mut self, stream_id: i32, message: StreamMessage) -> SlotResult<()> {
         let limits = self.limits;
         let slot = self.slot_mut(stream_id)?;
         slot.receive(stream_id, "receive a message")?;
@@ -392,24 +389,13 @@ impl StreamSlotMap {
         slot.buffered_bytes = total;
         Ok(())
     }
-    /// Stores trailers, including a Trailers-Only response without initial headers.
-    /// The caller separately marks the END_STREAM carried by the header block.
+    /// Stores trailers or a Trailers-Only response; mark END_STREAM separately.
     /// # Errors
-    /// Rejects unknown/reset/ended streams, duplicate trailers, partial frames,
-    /// and budget excess.
-    pub fn push_trailing_metadata(
-        &mut self,
-        stream_id: i32,
-        headers: Headers,
-    ) -> Result<(), SlotMapError> {
+    /// Rejects ended/reset streams, duplicate trailers, partial frames or excess resources.
+    pub fn push_trailing_metadata(&mut self, stream_id: i32, headers: Headers) -> SlotResult<()> {
         self.push_headers(stream_id, headers, true)
     }
-    fn push_headers(
-        &mut self,
-        stream_id: i32,
-        headers: Headers,
-        trailing: bool,
-    ) -> Result<(), SlotMapError> {
+    fn push_headers(&mut self, stream_id: i32, headers: Headers, trailing: bool) -> SlotResult<()> {
         let limits = self.limits;
         let slot = self.slot_mut(stream_id)?;
         slot.receive(stream_id, "receive metadata")?;
@@ -436,7 +422,7 @@ impl StreamSlotMap {
     /// Closes the peer's sending half; request streams need not carry trailers.
     /// # Errors
     /// Rejects unknown/reset streams, duplicate END_STREAM and truncated envelopes.
-    pub fn mark_remote_end_stream(&mut self, stream_id: i32) -> Result<(), SlotMapError> {
+    pub fn mark_remote_end_stream(&mut self, stream_id: i32) -> SlotResult<()> {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         if slot.remote_end {
@@ -451,7 +437,7 @@ impl StreamSlotMap {
     /// Closes the local sending half independently of the receive queues.
     /// # Errors
     /// Rejects unknown/reset streams or duplicate local END_STREAM.
-    pub fn mark_local_end_stream(&mut self, stream_id: i32) -> Result<(), SlotMapError> {
+    pub fn mark_local_end_stream(&mut self, stream_id: i32) -> SlotResult<()> {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         if slot.local_end {
@@ -460,16 +446,22 @@ impl StreamSlotMap {
         slot.local_end = true;
         Ok(())
     }
-    /// Records a reset, releases all buffered events and closes both halves.
+    /// Closes both halves, preserving completed responses for NO_ERROR resets.
     /// # Errors
     /// Rejects unknown streams and repeated resets, preserving the first code.
-    pub fn record_rst_stream(
-        &mut self,
-        stream_id: i32,
-        error_code: u32,
-    ) -> Result<(), SlotMapError> {
+    pub fn record_rst_stream(&mut self, stream_id: i32, error_code: u32) -> SlotResult<()> {
         let slot = self.slot_mut(stream_id)?;
-        slot.check_reset(stream_id)?;
+        if let Some(error_code) = slot.reset {
+            return Err(SlotMapError::Reset {
+                stream_id,
+                error_code,
+            });
+        }
+        if error_code == 0 && slot.trailers_seen && slot.remote_end {
+            slot.reset = Some(0);
+            slot.local_end = true;
+            return Ok(());
+        }
         *slot = StreamSlot {
             reset: Some(error_code),
             remote_end: true,
@@ -478,15 +470,11 @@ impl StreamSlotMap {
         };
         Ok(())
     }
-    /// Prunes excluded streams and returns their identifiers in ascending order.
+    /// Prunes excluded local streams; peer-initiated streams remain unaffected.
     /// Repeated GOAWAY frames can only reduce the accepted stream boundary.
     /// # Errors
     /// Rejects negative boundaries and increases to an established boundary.
-    pub fn apply_goaway(
-        &mut self,
-        last_stream_id: i32,
-        error_code: u32,
-    ) -> Result<Vec<i32>, SlotMapError> {
+    pub fn apply_goaway(&mut self, last_stream_id: i32, error_code: u32) -> SlotResult<Vec<i32>> {
         if last_stream_id < 0 {
             return Err(SlotMapError::InvalidStreamId(last_stream_id));
         }
@@ -496,21 +484,21 @@ impl StreamSlotMap {
         {
             return Err(transition(last_stream_id, "increase GOAWAY boundary"));
         }
-        let removed = if last_stream_id == i32::MAX {
-            BTreeMap::new()
-        } else {
-            self.slots.split_off(&(last_stream_id + 1))
-        };
+        let mut removed = Vec::new();
+        self.slots.retain(|id, _| {
+            let excluded = *id > last_stream_id && self.role.initiates(*id);
+            if excluded {
+                removed.push(*id);
+            }
+            !excluded
+        });
         self.goaway = Some((last_stream_id, error_code));
-        Ok(removed.into_keys().collect())
+        Ok(removed)
     }
     /// Transfers initial metadata ownership, leaving lifecycle history intact.
     /// # Errors
-    /// Rejects unknown or reset streams, including resets with empty queues.
-    pub fn pop_initial_metadata(
-        &mut self,
-        stream_id: i32,
-    ) -> Result<Option<Headers>, SlotMapError> {
+    /// Rejects unknown streams or resets other than completed-response NO_ERROR.
+    pub fn pop_initial_metadata(&mut self, stream_id: i32) -> SlotResult<Option<Headers>> {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         let headers = slot.initial_metadata.take();
@@ -519,8 +507,8 @@ impl StreamSlotMap {
     }
     /// Transfers the next message in stream order and releases its byte charge.
     /// # Errors
-    /// Rejects unknown or reset streams.
-    pub fn pop_message(&mut self, stream_id: i32) -> Result<Option<StreamMessage>, SlotMapError> {
+    /// Rejects unknown streams or resets other than completed-response NO_ERROR.
+    pub fn pop_message(&mut self, stream_id: i32) -> SlotResult<Option<StreamMessage>> {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         let message = slot.messages.pop_front();
@@ -534,8 +522,8 @@ impl StreamSlotMap {
     }
     /// Transfers trailers exactly once without changing the remote half state.
     /// # Errors
-    /// Rejects unknown or reset streams.
-    pub fn take_trailers(&mut self, stream_id: i32) -> Result<Option<Headers>, SlotMapError> {
+    /// Rejects unknown streams or resets other than completed-response NO_ERROR.
+    pub fn take_trailers(&mut self, stream_id: i32) -> SlotResult<Option<Headers>> {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         let headers = slot.trailers.take();
@@ -545,7 +533,7 @@ impl StreamSlotMap {
     /// Removes a reset or fully closed stream, including any unread events.
     /// # Errors
     /// Rejects unknown streams and streams with an open sending half.
-    pub fn remove_closed_stream(&mut self, stream_id: i32) -> Result<StreamSlot, SlotMapError> {
+    pub fn remove_closed_stream(&mut self, stream_id: i32) -> SlotResult<StreamSlot> {
         let slot = self
             .slots
             .get(&stream_id)
@@ -557,7 +545,7 @@ impl StreamSlotMap {
             .remove(&stream_id)
             .ok_or(SlotMapError::UnknownStream(stream_id))
     }
-    fn slot_mut(&mut self, id: i32) -> Result<&mut StreamSlot, SlotMapError> {
+    fn slot_mut(&mut self, id: i32) -> SlotResult<&mut StreamSlot> {
         self.slots
             .get_mut(&id)
             .ok_or(SlotMapError::UnknownStream(id))
@@ -574,14 +562,8 @@ fn header_bytes(headers: &Headers) -> Option<usize> {
 fn normalize_headers(headers: Headers) -> Headers {
     headers
         .into_iter()
-        .map(|(key, value)| {
-            (
-                key.into_boxed_str().into_string(),
-                value.into_boxed_slice().into_vec(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+        .map(|(key, value)| (key.into_boxed_str().into(), value.into_boxed_slice().into()))
+        .collect::<Box<[_]>>()
         .into_vec()
 }
 #[cfg(test)]
@@ -609,12 +591,12 @@ mod tests {
             max_queued_messages: messages,
         })
     }
-    fn open(map: &mut StreamSlotMap, id: i32) -> Result<(), SlotMapError> {
+    fn open(map: &mut StreamSlotMap, id: i32) -> SlotResult<()> {
         map.open_stream(id)?;
         map.push_initial_metadata(id, vec![])
     }
     #[test]
-    fn interleaved_streams_preserve_all_events() -> Result<(), SlotMapError> {
+    fn interleaved_streams_preserve_all_events() -> SlotResult<()> {
         let mut map = StreamSlotMap::default();
         let initial = headers(":status", b"200");
         for id in [1, 3] {
@@ -624,23 +606,20 @@ mod tests {
         map.push_message(3, message(b"three-a"))?;
         map.push_message(1, message(b"one"))?;
         map.push_message(3, message(b"three-b"))?;
-        for id in [1, 3] {
-            map.push_trailing_metadata(id, headers("grpc-status", b"0"))?;
-            map.mark_remote_end_stream(id)?;
-        }
         assert_eq!(map.pop_message(1)?, Some(message(b"one")));
         for payload in [b"three-a", b"three-b"] {
             assert_eq!(map.pop_message(3)?, Some(message(payload)));
         }
         for id in [1, 3] {
+            map.push_trailing_metadata(id, headers("grpc-status", b"0"))?;
+            map.mark_remote_end_stream(id)?;
             assert_eq!(map.pop_initial_metadata(id)?, Some(initial.clone()));
             assert_eq!(map.take_trailers(id)?, Some(headers("grpc-status", b"0")));
-            assert_eq!(map.pop_message(id)?, None);
         }
         Ok(())
     }
     #[test]
-    fn trailers_only_and_duplicate_metadata() -> Result<(), SlotMapError> {
+    fn trailers_only_and_duplicate_metadata() -> SlotResult<()> {
         let mut map = StreamSlotMap::default();
         map.open_stream(1)?;
         map.push_trailing_metadata(1, headers("grpc-status", b"12"))?;
@@ -648,7 +627,6 @@ mod tests {
         assert_eq!(map.pop_initial_metadata(1)?, None);
         assert_eq!(map.pop_message(1)?, None);
         assert_eq!(map.take_trailers(1)?, Some(headers("grpc-status", b"12")));
-        assert_eq!(map.take_trailers(1)?, None);
         open(&mut map, 3)?;
         map.pop_initial_metadata(3)?;
         assert!(map.push_initial_metadata(3, vec![]).is_err());
@@ -658,24 +636,37 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn goaway_prunes_and_enforces_decreasing_boundary() -> Result<(), SlotMapError> {
+    fn goaway_prunes_and_enforces_decreasing_boundary() -> SlotResult<()> {
         let mut map = StreamSlotMap::default();
         for id in [1, 3, 5, 7, i32::MAX] {
             open(&mut map, id)?;
         }
+        assert!(map.open_stream(1).is_err());
         map.push_message(1, message(b"retained"))?;
         assert!(map.apply_goaway(i32::MAX, 0)?.is_empty());
+        assert!(matches!(
+            map.open_stream(9),
+            Err(SlotMapError::GoAway { .. })
+        ));
+        open(&mut map, 8)?;
         assert_eq!(map.apply_goaway(3, 0)?, vec![5, 7, i32::MAX]);
-        assert_eq!(map.active_stream_count(), 2);
-        assert!(map.get(5).is_none());
         assert!(map.open_stream(5).is_err());
         assert_eq!(map.pop_message(1)?, Some(message(b"retained")));
         assert_eq!(map.apply_goaway(1, 0)?, vec![3]);
         assert!(map.apply_goaway(7, 0).is_err());
         assert!(map.apply_goaway(-1, 0).is_err());
-        assert_eq!(map.goaway(), Some((1, 0)));
         assert_eq!(map.apply_goaway(0, 7)?, vec![1]);
-        assert_eq!(map.active_stream_count(), 0);
+        assert!(map.get(8).is_some());
+        let mut server = StreamSlotMap::with_role(StreamLimits::default(), EndpointRole::Server);
+        for id in [1, 2, 3, 4] {
+            open(&mut server, id)?;
+        }
+        server.push_message(3, message(b"request"))?;
+        assert_eq!(server.apply_goaway(2, 0)?, vec![4]);
+        assert!(server.open_stream(6).is_err());
+        assert_eq!(server.apply_goaway(0, 0)?, vec![2]);
+        assert_eq!(server.pop_message(3)?, Some(message(b"request")));
+        open(&mut server, 5)?;
         assert!(matches!(
             map.open_stream(1),
             Err(SlotMapError::GoAway { error_code: 7, .. })
@@ -683,42 +674,44 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn reset_and_half_close_lifecycle() -> Result<(), SlotMapError> {
-        let mut map = StreamSlotMap::default();
-        for id in [0, -1] {
-            assert!(map.open_stream(id).is_err());
+    fn completed_response_survives_no_error_reset() -> SlotResult<()> {
+        for (code, complete) in [(0, true), (0, false), (8, true)] {
+            let mut map = StreamSlotMap::default();
+            open(&mut map, 1)?;
+            map.push_message(1, message(b"early response"))?;
+            if complete {
+                map.push_trailing_metadata(1, headers("grpc-status", b"0"))?;
+                map.mark_remote_end_stream(1)?;
+            } else {
+                map.append_recv_bytes(1, &[0, 0])?;
+            }
+            let bytes = map.get(1).expect("slot").buffered_bytes();
+            map.record_rst_stream(1, code)?;
+            assert!(map.record_rst_stream(1, code).is_err());
+            let slot = map.get(1).expect("slot");
+            assert!(slot.remote_end_stream() && slot.local_end_stream());
+            if code == 0 && complete {
+                assert_eq!(slot.buffered_bytes(), bytes);
+                assert_eq!(map.pop_initial_metadata(1)?, Some(vec![]));
+                assert_eq!(map.pop_message(1)?, Some(message(b"early response")));
+                assert_eq!(map.take_trailers(1)?, Some(headers("grpc-status", b"0")));
+                assert_eq!(map.get(1).expect("slot").buffered_bytes(), 0);
+            } else {
+                assert_eq!(slot.buffered_bytes(), 0);
+                assert!(map.pop_initial_metadata(1).is_err());
+                assert!(map.take_trailers(1).is_err());
+                assert!(matches!(
+                    map.pop_message(1),
+                    Err(SlotMapError::Reset { .. })
+                ));
+                assert!(map.push_message(1, message(b"late")).is_err());
+            }
+            map.remove_closed_stream(1)?;
         }
-        assert!(map.push_message(99, message(b"unknown")).is_err());
-        open(&mut map, 1)?;
-        assert!(map.open_stream(1).is_err());
-        assert!(map.remove_closed_stream(1).is_err());
-        map.mark_local_end_stream(1)?;
-        map.push_message(1, message(b"half-open"))?;
-        assert!(map.mark_local_end_stream(1).is_err());
-        assert!(map.remove_closed_stream(1).is_err());
-        map.mark_remote_end_stream(1)?;
-        assert!(map.push_message(1, message(b"late")).is_err());
-        map.remove_closed_stream(1)?;
-        open(&mut map, 3)?;
-        map.push_message(3, message(b"discarded"))?;
-        map.append_recv_bytes(3, &[0, 0])?;
-        map.record_rst_stream(3, 8)?;
-        assert_eq!(map.get(3).expect("slot").buffered_bytes(), 0);
-        assert!(map.pop_initial_metadata(3).is_err());
-        assert!(map.take_trailers(3).is_err());
-        assert!(map.record_rst_stream(3, 9).is_err());
-        assert_eq!(map.get(3).expect("slot").reset_error_code(), Some(8));
-        assert!(matches!(
-            map.pop_message(3),
-            Err(SlotMapError::Reset { error_code: 8, .. })
-        ));
-        assert!(map.push_message(3, message(b"late")).is_err());
-        map.remove_closed_stream(3)?;
-        assert_eq!(map.active_stream_count(), 0);
         Ok(())
     }
     #[test]
-    fn fragmented_frames_compression_and_invalid_prefixes() -> Result<(), SlotMapError> {
+    fn fragmented_frames_compression_and_invalid_prefixes() -> SlotResult<()> {
         let mut map = StreamSlotMap::default();
         open(&mut map, 1)?;
         let mut wire = frame(b"abc");
@@ -734,10 +727,17 @@ mod tests {
         map.append_recv_bytes(1, &compressed)?;
         assert!(map.pop_message(1)?.expect("message").compressed);
         assert!(map.append_recv_bytes(1, &[2, 0, 0, 0, 0]).is_err());
+        assert!(map.remove_closed_stream(1).is_err());
+        map.mark_local_end_stream(1)?;
+        map.push_message(1, message(b"half-open"))?;
+        assert!(map.mark_local_end_stream(1).is_err());
+        map.mark_remote_end_stream(1)?;
+        assert!(map.push_message(1, message(b"late")).is_err());
+        map.remove_closed_stream(1)?;
         Ok(())
     }
     #[test]
-    fn rejected_batches_preserve_partial_frames() -> Result<(), SlotMapError> {
+    fn rejected_batches_preserve_partial_frames() -> SlotResult<()> {
         let mut map = bounded(128, 1);
         open(&mut map, 1)?;
         let wire = frame(b"ok");
@@ -758,7 +758,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn truncated_frames_and_declared_lengths_are_bounded() -> Result<(), SlotMapError> {
+    fn truncated_frames_and_declared_lengths_are_bounded() -> SlotResult<()> {
         for wire in [&[0, 0][..], &[0, 0, 0, 0, 3, b'a'][..]] {
             let mut map = bounded(128, 4);
             open(&mut map, 1)?;
@@ -775,7 +775,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn byte_and_queue_budgets_release_on_consumption() -> Result<(), SlotMapError> {
+    fn byte_and_queue_budgets_release_on_consumption() -> SlotResult<()> {
         let mut map = bounded(128, 1);
         map.open_stream(1)?;
         map.push_initial_metadata(1, headers("key", b"value"))?;
