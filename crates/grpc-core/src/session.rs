@@ -156,19 +156,22 @@ fn metadata(headers: &Headers) -> Result<Metadata, Status> {
     Ok(result)
 }
 #[rustfmt::skip]
+fn validate_content_type(value: &str) -> Result<(), Status> {
+    let media = value.split(';').next().unwrap_or("");
+    let suffix = media.strip_prefix("application/grpc+");
+    if !value.bytes().all(|b| (32..127).contains(&b)) || !(media == "application/grpc" || suffix.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)))) { return Err(Status::invalid_argument("invalid gRPC content-type")); }
+    Ok(())
+}
+#[rustfmt::skip]
 fn validate_metadata(metadata: &Metadata) -> Result<(), Status> {
-    if metadata.iter().any(|(key, _)| matches!(key, "content-type" | "te" | "user-agent")) {
-        return Err(Status::invalid_argument("application metadata contains protocol header"));
-    }
+    if metadata.iter().any(|(key, _)| matches!(key, "content-type" | "te" | "user-agent")) { return Err(Status::invalid_argument("application metadata contains protocol header")); }
     Ok(())
 }
 #[rustfmt::skip]
 fn value<'a>(headers: &'a Headers, key: &str) -> Result<Option<&'a str>, Status> {
     let mut values = headers.iter().filter(|(k, _)| k == key);
     let result = values.next().map(|(_, v)| std::str::from_utf8(v).map_err(internal)).transpose()?;
-    if values.next().is_some() {
-        return Err(Status::internal(format!("duplicate {key}")));
-    }
+    if values.next().is_some() { return Err(Status::internal(format!("duplicate {key}"))); }
     Ok(result)
 }
 #[rustfmt::skip]
@@ -183,10 +186,10 @@ macro_rules! constructor {
                     || config.initial_window_size > i32::MAX as u32
                     || !(16_384..=16_777_215).contains(&config.max_frame_size)
                     || !matches!(config.scheme.as_str(), "http" | "https")
-                    || !config.content_type.starts_with("application/grpc") || !config.content_type.bytes().all(|b| (32..127).contains(&b))
                 {
                     return Err(Status::invalid_argument("invalid HTTP/2 session configuration"));
                 }
+                validate_content_type(&config.content_type)?;
                 let mut options = SessionOptions::new().map_err(internal)?;
                 options.set_no_auto_window_update(true).set_peer_max_concurrent_streams(config.max_concurrent_streams).set_max_send_header_block_length(config.max_header_list_size as usize);
                 let mut native = <$native>::new_default(Some(&options), None).map_err(internal)?;
@@ -217,17 +220,24 @@ impl GrpcClientSession {
     /// # Errors
     /// Rejects stream limits, invalid metadata/timeout or native submission failure.
     pub fn start_request(&mut self, authority: &str, path: &str, metadata: &Metadata, timeout: Option<Timeout>, encoding: CompressionAlgorithm, end_stream: bool) -> Result<i32, Status> {
+        let content_type = self.config.content_type.clone();
+        self.start_request_with_content_type(authority, path, metadata, timeout, encoding, end_stream, &content_type)
+    }
+    /// Starts a request with a codec media type independently of other RPCs.
+    /// # Errors
+    /// Rejects invalid media types, metadata, stream limits or native submission failure.
+    #[expect(clippy::too_many_arguments, reason = "The request carries routing, metadata, deadline, encoding and codec identity.")]
+    pub fn start_request_with_content_type(&mut self, authority: &str, path: &str, metadata: &Metadata, timeout: Option<Timeout>, encoding: CompressionAlgorithm, end_stream: bool, content_type: &str) -> Result<i32, Status> {
+        validate_content_type(content_type)?;
         self.check_capacity()?;
-        if authority.is_empty() || !path.starts_with('/') {
-            return Err(Status::invalid_argument("invalid RPC authority or path"));
-        }
+        if authority.is_empty() || !path.starts_with('/') { return Err(Status::invalid_argument("invalid RPC authority or path")); }
         let mut headers = vec![
             (":method".into(), "POST".into()),
             (":scheme".into(), self.config.scheme.clone()),
             (":authority".into(), authority.into()),
             (":path".into(), path.into()),
             ("te".into(), "trailers".into()),
-            ("content-type".into(), self.config.content_type.clone()),
+            ("content-type".into(), content_type.into()),
             ("user-agent".into(), self.config.user_agent.clone()),
             ("grpc-accept-encoding".into(), ACCEPT.into()),
         ];
@@ -267,7 +277,11 @@ impl GrpcServerSession {
     /// Sends response headers and installs an incremental body source.
     /// # Errors
     /// Rejects duplicate headers, ended streams and native submission failure.
-    pub fn send_initial_metadata(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm) -> Result<(), Status> { self.begin_response(id, metadata, encoding) }
+    pub fn send_initial_metadata(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm) -> Result<(), Status> { self.send_initial_metadata_with_content_type(id, metadata, encoding, &self.config.content_type.clone()) }
+    /// Starts a response using the codec selected for this RPC's route.
+    /// # Errors
+    /// Rejects invalid media types, duplicate headers, ended streams or native failure.
+    pub fn send_initial_metadata_with_content_type(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm, content_type: &str) -> Result<(), Status> { self.begin_response(id, metadata, encoding, content_type) }
     /// Completes a response, emitting trailers only when its queued DATA has drained.
     /// # Errors
     /// Rejects duplicate completion, invalid streams, budgets or native failure.
@@ -299,12 +313,11 @@ impl GrpcServerSession {
 }
 #[rustfmt::skip]
 impl<Role> GrpcSession<Role> {
-    fn begin_response(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm) -> Result<(), Status> {
+    fn begin_response(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm, content_type: &str) -> Result<(), Status> {
+        validate_content_type(content_type)?;
         self.check_send(id)?;
-        if self.stream_mut(id)?.sent_initial {
-            return Err(Status::failed_precondition("response headers already sent"));
-        }
-        let mut headers = vec![(":status".into(), "200".into()), ("content-type".into(), self.config.content_type.clone()), ("grpc-accept-encoding".into(), ACCEPT.into())];
+        if self.stream_mut(id)?.sent_initial { return Err(Status::failed_precondition("response headers already sent")); }
+        let mut headers = vec![(":status".into(), "200".into()), ("content-type".into(), content_type.into()), ("grpc-accept-encoding".into(), ACCEPT.into())];
         if encoding != CompressionAlgorithm::Identity {
             headers.push(("grpc-encoding".into(), encoding.as_str().into()));
         }
@@ -372,9 +385,7 @@ impl<Role> GrpcSession<Role> {
     fn check_send(&self, id: i32) -> Result<(), Status> {
         self.check_live()?;
         let stream = self.streams.get(&id).ok_or_else(|| Status::not_found("unknown stream"))?;
-        if let Some(error) = &stream.failure {
-            return Err(error.clone());
-        }
+        if let Some(error) = &stream.failure { return Err(error.clone()); }
         let slot = self.slots.get(id).ok_or_else(|| Status::not_found("unknown stream"))?;
         if slot.local_end_stream() { return Err(Status::failed_precondition("sending half already closed")); }
         Ok(())
@@ -393,21 +404,17 @@ impl<Role> GrpcSession<Role> {
     pub fn send_message(&mut self, id: i32, payload: &[u8], encoding: CompressionAlgorithm) -> Result<(), Status> {
         self.check_send(id)?;
         if !self.client() && !self.stream_mut(id)?.sent_initial {
-            self.begin_response(id, &Metadata::new(), encoding)?;
+            self.begin_response(id, &Metadata::new(), encoding, &self.config.content_type.clone())?;
         }
 
-        if encoding != CompressionAlgorithm::Identity && encoding != self.stream_mut(id)?.outgoing_encoding {
-            return Err(Status::invalid_argument("message encoding differs from stream encoding"));
-        }
+        if encoding != CompressionAlgorithm::Identity && encoding != self.stream_mut(id)?.outgoing_encoding { return Err(Status::invalid_argument("message encoding differs from stream encoding")); }
         if payload.len() > self.config.per_stream_byte_budget { return Err(resource()); }
         let compressed = CompressionConfig { algorithm: encoding, ..self.config.compression }.compress(payload)?;
         let frame = AlignedMessageBuf::new(&compressed.data, compressed.compressed)?;
         let budget = self.config.per_stream_byte_budget;
         let stream = self.stream_mut(id)?;
         let mut queue = stream.outgoing.borrow_mut();
-        if queue.bytes.len().checked_add(frame.wire_bytes().len()).is_none_or(|n| n > budget) {
-            return Err(resource());
-        }
+        if queue.bytes.len().checked_add(frame.wire_bytes().len()).is_none_or(|n| n > budget) { return Err(resource()); }
         queue.bytes.extend(frame.wire_bytes());
         drop(queue);
         self.resume(id)
@@ -518,9 +525,7 @@ impl<Role> GrpcSession<Role> {
         let mut used = 0;
         while used < n {
             let count = self.mem_recv(&buf[used..n])?;
-            if count == 0 {
-                return Err(Status::internal("HTTP/2 receive made no progress"));
-            }
+            if count == 0 { return Err(Status::internal("HTTP/2 receive made no progress")); }
             used += count;
         }
         self.flush_to_transport(transport)?;
@@ -556,9 +561,7 @@ impl<Role> GrpcSession<Role> {
     /// Returns unknown/reset stream or invalid metadata errors.
     pub fn take_trailers(&mut self, id: i32) -> Result<Option<(Status, Metadata)>, Status> {
         if let Some(error) = self.stream_mut(id)?.failure.clone() {
-            if self.stream_mut(id)?.failure_taken {
-                return Ok(None);
-            }
+            if self.stream_mut(id)?.failure_taken { return Ok(None); }
             self.stream_mut(id)?.failure_taken = true;
             return Ok(Some((error, Metadata::new())));
         }
@@ -613,9 +616,7 @@ impl<Role> GrpcSession<Role> {
         match event {
             SessionEvent::BeginHeaders { stream_id: id, .. } => {
                 if !self.streams.contains_key(&id) {
-                    if self.client() {
-                        return Err(Status::internal("unsolicited server stream"));
-                    }
+                    if self.client() { return Err(Status::internal("unsolicited server stream")); }
                     self.open(id, Rc::new(RefCell::new(Outbound::default())), CompressionAlgorithm::Identity)?;
                 }
                 let stream = self.stream_mut(id)?;
@@ -629,9 +630,7 @@ impl<Role> GrpcSession<Role> {
                 let stream = self.stream_mut(id)?;
                 let size = name.len().checked_add(value.len()).and_then(|n| n.checked_add(32)).ok_or_else(resource)?;
                 let total = stream.header_bytes.checked_add(size).ok_or_else(resource)?;
-                if total > max || retained.checked_add(total).and_then(|n| n.checked_add(stream.reserved)).is_none_or(|n| n > budget) {
-                    return Err(resource());
-                }
+                if total > max || retained.checked_add(total).and_then(|n| n.checked_add(stream.reserved)).is_none_or(|n| n > budget) { return Err(resource()); }
                 stream.header_bytes = total;
                 stream.headers.push((String::from_utf8(name).map_err(internal)?, value));
             }
@@ -717,9 +716,7 @@ impl<Role> GrpcSession<Role> {
         if self.client() && end {
             if let Some(code) = value(&headers, "grpc-status")? {
                 let n = code.parse::<i32>().map_err(internal)?;
-                if !(0..=16).contains(&n) {
-                    return Err(Status::internal("invalid grpc-status"));
-                }
+                if !(0..=16).contains(&n) { return Err(Status::internal("invalid grpc-status")); }
             } else {
                 return self.missing_trailers(id);
             }
@@ -778,9 +775,7 @@ impl<Role> GrpcSession<Role> {
                     }
                 }
             }
-            if retained.checked_add(completed).and_then(|n| n.checked_add(stream.reserved)).and_then(|n| n.checked_add(stream.prefix.len())).is_none_or(|n| n > budget) {
-                return Err(resource());
-            }
+            if retained.checked_add(completed).and_then(|n| n.checked_add(stream.reserved)).and_then(|n| n.checked_add(stream.prefix.len())).is_none_or(|n| n > budget) { return Err(resource()); }
         }
         let frames = stream.decoder.push(data)?;
         let encoding = stream.encoding;
