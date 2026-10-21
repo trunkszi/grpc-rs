@@ -26,4 +26,7 @@ pub use metadata::{
 pub use method::{MethodDescriptor, RpcCardinality};
 pub use request::Request;
 pub use response::Response;
+pub use session::{
+    GrpcClientSession, GrpcServerSession, GrpcSession, IncomingRequest, SessionConfig, Timeout,
+};
 pub use status::{Code, Status};
