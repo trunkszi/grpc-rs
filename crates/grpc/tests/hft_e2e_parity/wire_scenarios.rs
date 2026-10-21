@@ -19,7 +19,7 @@ use grpc::{
     },
     stream::StreamError,
 };
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult = anyhow::Result<()>;
 fn metadata() -> Metadata {
     let mut values = Metadata::new();
     values.append_ascii("x-desk", "hft").unwrap();

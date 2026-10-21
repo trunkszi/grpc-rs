@@ -27,6 +27,7 @@ grpc-codec-fory = { workspace = true, optional = true }
 grpc-codec-capnp = { workspace = true, optional = true }
 
 [build-dependencies]
+anyhow = { workspace = true }
 grpc-build = { workspace = true }
 
 [dev-dependencies]

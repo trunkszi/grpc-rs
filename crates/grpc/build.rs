@@ -1,8 +1,10 @@
 //! Compile only the IDLs selected by the facade's codec features.
-use std::{env, error::Error, path::PathBuf};
+use std::{env, path::PathBuf};
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let root = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
+use anyhow::Context;
+
+fn main() -> anyhow::Result<()> {
+    let root = PathBuf::from(env::var_os("OUT_DIR").context("OUT_DIR is not set")?);
     for (feature, extension, directory) in [
         ("PROTOBUF", "proto", "protobuf"),
         ("FORY", "fdl", "fory"),
