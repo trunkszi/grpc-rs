@@ -42,7 +42,6 @@ trait OrderService {
     #[bidi_streaming]
     fn order_stream(request: String) -> String;
 }
-
 struct OrderBook;
 impl OrderService for OrderBook {
     fn place_order(&mut self, request: Request<String>) -> Result<Response<String>, Status> {
@@ -98,7 +97,6 @@ fn options(metadata: Metadata, compression: Option<CompressionAlgorithm>) -> Cal
         ..CallOptions::default()
     }
 }
-
 // Generated stubs use Vec envelopes for streaming; this adapter connects them to
 // the live channel and interleaves each bidi send with its corresponding reply.
 impl<T: SyncTransport + 'static, C> OrderServiceChannel<C> for SyncChannel<T>
@@ -246,7 +244,6 @@ where
     })?;
     Ok(())
 }
-
 #[cfg(feature = "capnp")]
 #[derive(Default)]
 struct CapnpText(
@@ -280,7 +277,6 @@ impl Codec for CapnpText {
         Ok(root.to_str()?.to_string())
     }
 }
-
 #[derive(Default)]
 struct Trace {
     sent: Vec<u8>,
@@ -288,6 +284,7 @@ struct Trace {
 }
 struct Recorded<T> {
     inner: Rc<RefCell<T>>,
+    blocked: Rc<std::cell::Cell<bool>>,
     trace: Arc<Mutex<Trace>>,
 }
 impl<T: SyncTransport> Read for Recorded<T> {
@@ -303,6 +300,9 @@ impl<T: SyncTransport> Read for Recorded<T> {
 }
 impl<T: SyncTransport> Write for Recorded<T> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.blocked.get() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let n = self.inner.borrow_mut().write(bytes)?;
         self.trace
             .lock()
@@ -332,12 +332,14 @@ impl<T: SyncTransport> SyncTransport for Recorded<T> {
 type HeaderBlock = Vec<(Vec<u8>, Vec<u8>)>;
 struct Wire {
     headers: BTreeMap<i32, HeaderBlock>,
+    header_flags: BTreeMap<i32, Vec<u8>>,
     data: BTreeMap<i32, Vec<u8>>,
     goaway: Option<(i32, u32)>,
 }
 fn wire(bytes: &[u8]) -> Wire {
     let mut result = Wire {
         headers: BTreeMap::new(),
+        header_flags: BTreeMap::new(),
         data: BTreeMap::new(),
         goaway: None,
     };
@@ -354,6 +356,7 @@ fn wire(bytes: &[u8]) -> Wire {
         let payload = &bytes[offset + 9..offset + 9 + len];
         match h[3] {
             1 => {
+                result.header_flags.entry(id).or_default().push(h[4]);
                 assert_eq!(h[4] & 4, 4, "bounded test metadata fits one HEADERS block");
                 for field in inflater.inflate_block(payload).unwrap() {
                     result
@@ -387,7 +390,6 @@ fn header<'a>(wire: &'a Wire, id: i32, name: &[u8]) -> &'a [u8] {
         .expect("wire header")
         .1
 }
-
 fn exercise<T, S, C>(client: T, server: S) -> TestResult
 where
     T: SyncTransport + 'static,
@@ -421,6 +423,12 @@ fn check_trace(trace: &Arc<Mutex<Trace>>) {
     assert_eq!(header(&received, 1, b"execution-id"), b"fill-42");
     assert_eq!(header(&received, 1, b"grpc-status"), b"0");
     for (id, code) in [(11, b"7".as_slice()), (13, b"12".as_slice())] {
+        assert_eq!(
+            received.header_flags[&id],
+            [5],
+            "one END_STREAM HEADERS block"
+        );
+        assert_eq!(header(&received, id, b":status"), b"200");
         assert_eq!(header(&received, id, b"grpc-status"), code);
         assert!(
             !received.data.contains_key(&id),
@@ -443,6 +451,7 @@ where
     let channel = SyncChannel::with_config(
         Recorded {
             inner: client,
+            blocked: Rc::default(),
             trace: Arc::clone(&trace),
         },
         ChannelConfig {
@@ -664,7 +673,13 @@ fn e2e_tls13_h2_loopback_generated_all_shapes() -> TestResult {
     let tls = Rc::new(RefCell::new(tls));
     let trace = Arc::new(Mutex::new(Trace::default()));
     let result = client_calls::<_, WireCodec>(Rc::clone(&tls), Arc::clone(&trace), "https");
-    let closed = tls.borrow_mut().close_notify();
+    let closed = (|| -> io::Result<()> {
+        let mut transport = tls.borrow_mut();
+        transport.set_nonblocking(false)?;
+        transport.set_write_timeout(Some(Duration::from_secs(5)))?;
+        transport.close_notify()
+    })();
+    drop(tls);
     let served = worker.join().expect("TLS server panicked");
     result?;
     closed?;
@@ -706,10 +721,17 @@ fn e2e_compressed_response_exceeding_decoded_limit_is_resource_exhausted() -> Te
 }
 
 #[test]
-fn e2e_completed_rpc_drains_before_goaway_and_server_exit() -> TestResult {
+fn e2e_backpressured_rpc_drains_through_goaway_before_server_exit() -> TestResult {
     let (client, server) = MemoryPipe::pair();
     let worker = thread::spawn(move || -> Result<(), Status> {
-        let mut server = SyncServer::new(server)?;
+        let blocked = Rc::new(std::cell::Cell::new(false));
+        let gate = Rc::clone(&blocked);
+        let mut server = SyncServer::new(Recorded {
+            inner: Rc::new(RefCell::new(server)),
+            blocked: gate,
+            trace: Arc::new(Mutex::new(Trace::default())),
+        })?;
+        let response_gate = Rc::clone(&blocked);
         let completed = Rc::new(std::cell::Cell::new(false));
         let observed = Rc::clone(&completed);
         let mut generated = OrderServiceServer::new(OrderBook, ());
@@ -717,6 +739,7 @@ fn e2e_completed_rpc_drains_before_goaway_and_server_exit() -> TestResult {
             ORDER_SERVICE_PLACE_ORDER.path,
             WireCodec::default(),
             move |request, sink| {
+                response_gate.set(true);
                 sink.send(generated.place_order(request)?.get_ref())
                     .map_err(stream_status)?;
                 sink.finish(Status::ok(""), trailers())
@@ -732,7 +755,10 @@ fn e2e_completed_rpc_drains_before_goaway_and_server_exit() -> TestResult {
                 thread::yield_now();
             }
         }
+        // The response and END_STREAM trailers are queued behind transport backpressure.
+        assert!(blocked.get());
         server.shutdown_with_goaway(0)?;
+        blocked.set(false);
         server.serve_connection()
     });
     let trace = Arc::new(Mutex::new(Trace::default()));
@@ -741,6 +767,7 @@ fn e2e_completed_rpc_drains_before_goaway_and_server_exit() -> TestResult {
         let mut channel = SyncChannel::with_config(
             Recorded {
                 inner: Rc::clone(&client),
+                blocked: Rc::default(),
                 trace: Arc::clone(&trace),
             },
             ChannelConfig {
