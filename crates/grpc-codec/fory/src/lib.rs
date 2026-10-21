@@ -60,6 +60,13 @@ impl<E, D> ForyCodec<E, D> {
     }
 
     /// Takes ownership of a configured Fory instance with completed registrations.
+    ///
+    /// For untrusted RPC input, keep Fory's string validation and resource limits
+    /// enabled. Options disabling validation require trusted payloads, as documented
+    /// by the backend. Custom serializers must not recursively invoke backend
+    /// serialization or deserialization while using a supplied context. Discard
+    /// the codec if a serializer panics; backend context recovery applies to
+    /// errors returned as `Result`, not unwinding.
     pub fn with_fory(fory: Fory) -> Self {
         Self {
             fory,
@@ -86,7 +93,11 @@ impl<E: Serializer, D: Serializer> Codec for ForyCodec<E, D> {
         item: &Self::EncodeItem,
         destination: &mut Vec<u8>,
     ) -> Result<(), Self::Error> {
-        self.fory.serialize_to_with::<E>(destination, item)?;
+        // The backend's borrowed-buffer writer is not detached if a custom
+        // serializer panics. Its owned writer keeps cleanup independent of the
+        // caller's Vec; only successfully serialized payloads are appended.
+        let payload = self.fory.serialize_with::<E>(item)?;
+        destination.extend_from_slice(&payload);
         Ok(())
     }
 
@@ -331,5 +342,157 @@ mod tests {
             assert_eq!(native_codec.decode(&native_bytes).unwrap(), message);
             assert_eq!(default_codec.decode(&default_bytes).unwrap(), "built-in");
         }
+    }
+
+    #[test]
+    fn integration_scenario_noncanonical_root_headers_do_not_poison_context() {
+        let mut codec = ForyCodec::<String>::new();
+        let message = "valid after malformed root".to_owned();
+        let mut valid = Vec::new();
+        codec.encode(&message, &mut valid).unwrap();
+        assert_eq!(codec.decode(&valid).unwrap(), message);
+        for header in u8::MIN..=u8::MAX {
+            if header == valid[0] {
+                continue;
+            }
+            let mut invalid = valid.clone();
+            invalid[0] = header;
+            assert!(codec.decode(&invalid).is_err(), "root header {header:#04x}");
+            assert_eq!(codec.decode(&valid).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn integration_scenario_cross_language_mode_mismatch_recovers_both_codecs() {
+        let mut native = ForyCodec::<String>::with_fory(Fory::builder().xlang(false).build());
+        let mut cross_language =
+            ForyCodec::<String>::with_fory(Fory::builder().xlang(true).build());
+        let message = "same type, different wire configuration".to_owned();
+        let mut native_bytes = Vec::new();
+        let mut cross_language_bytes = Vec::new();
+        native.encode(&message, &mut native_bytes).unwrap();
+        cross_language
+            .encode(&message, &mut cross_language_bytes)
+            .unwrap();
+        assert_eq!(native.decode(&native_bytes).unwrap(), message);
+        assert_eq!(
+            cross_language.decode(&cross_language_bytes).unwrap(),
+            message
+        );
+        assert!(native.decode(&cross_language_bytes).is_err());
+        assert!(cross_language.decode(&native_bytes).is_err());
+        assert_eq!(native.decode(&native_bytes).unwrap(), message);
+        assert_eq!(
+            cross_language.decode(&cross_language_bytes).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn integration_scenario_partial_custom_write_preserves_preceding_payload() {
+        let mut fory = Fory::builder().build();
+        fory.register_serializer::<CheckedSerializer>(120).unwrap();
+        let mut codec = ForyCodec::<CheckedSerializer>::with_fory(fory);
+        let mut bytes = b"prefix".to_vec();
+        let first_start = bytes.len();
+        codec.encode(&ExternalValue(17), &mut bytes).unwrap();
+        let first_end = bytes.len();
+        let preceding = bytes.clone();
+        assert!(codec.encode(&ExternalValue(-1), &mut bytes).is_err());
+        assert_eq!(bytes, preceding);
+        codec.encode(&ExternalValue(42), &mut bytes).unwrap();
+        assert_eq!(&bytes[..first_start], b"prefix");
+        assert_eq!(
+            codec.decode(&bytes[first_start..first_end]).unwrap(),
+            ExternalValue(17)
+        );
+        assert_eq!(
+            codec.decode(&bytes[first_end..]).unwrap(),
+            ExternalValue(42)
+        );
+    }
+
+    struct ReadCheckedSerializer;
+
+    impl Serializer for ReadCheckedSerializer {
+        type Target = ExternalValue;
+
+        fn write_data(
+            value: &ExternalValue,
+            context: &mut backend::WriteContext,
+        ) -> Result<(), backend::Error> {
+            context.writer.write_i32(value.0);
+            Ok(())
+        }
+
+        fn read_data(context: &mut backend::ReadContext) -> Result<ExternalValue, backend::Error> {
+            let value = context.reader.read_i32()?;
+            if value < 0 {
+                return Err(backend::Error::invalid_data("negative body rejected"));
+            }
+            Ok(ExternalValue(value))
+        }
+    }
+
+    #[test]
+    fn integration_scenario_custom_body_and_trailing_errors_allow_valid_error_valid() {
+        let mut fory = Fory::builder().build();
+        fory.register_serializer::<ReadCheckedSerializer>(121)
+            .unwrap();
+        let mut codec = ForyCodec::<ReadCheckedSerializer>::with_fory(fory);
+        let mut invalid_body = Vec::new();
+        codec.encode(&ExternalValue(-1), &mut invalid_body).unwrap();
+        let mut valid = Vec::new();
+        for value in [0, 17, i32::MAX] {
+            valid.clear();
+            codec.encode(&ExternalValue(value), &mut valid).unwrap();
+            assert_eq!(codec.decode(&valid).unwrap(), ExternalValue(value));
+            let error = codec.decode(&invalid_body).unwrap_err();
+            assert!(error.to_string().contains("negative body rejected"));
+            assert_eq!(codec.decode(&valid).unwrap(), ExternalValue(value));
+            let mut trailing = valid.clone();
+            trailing.extend_from_slice(&invalid_body);
+            let error = codec.decode(&trailing).unwrap_err();
+            assert!(error.to_string().contains("trailing bytes"));
+            assert_eq!(codec.decode(&valid).unwrap(), ExternalValue(value));
+        }
+    }
+
+    struct PanickingSerializer;
+
+    impl Serializer for PanickingSerializer {
+        type Target = ExternalValue;
+
+        fn write_data(
+            value: &ExternalValue,
+            context: &mut backend::WriteContext,
+        ) -> Result<(), backend::Error> {
+            context.writer.write_i32(value.0);
+            panic!("custom serializer panicked after writing its body");
+        }
+
+        fn read_data(context: &mut backend::ReadContext) -> Result<ExternalValue, backend::Error> {
+            Ok(ExternalValue(context.reader.read_i32()?))
+        }
+    }
+
+    #[test]
+    fn integration_scenario_custom_writer_panic_keeps_caller_buffer_owned() {
+        std::thread::spawn(|| {
+            let mut fory = Fory::builder().build();
+            fory.register_serializer::<PanickingSerializer>(122)
+                .unwrap();
+            let mut codec = ForyCodec::<PanickingSerializer>::with_fory(fory);
+            let mut bytes = b"caller-owned prefix".to_vec();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                codec.encode(&ExternalValue(17), &mut bytes).unwrap();
+            }));
+            assert!(result.is_err());
+            assert_eq!(bytes, b"caller-owned prefix");
+            // The caller buffer is gone before thread-local backend contexts are dropped.
+            drop(bytes);
+        })
+        .join()
+        .unwrap();
     }
 }
