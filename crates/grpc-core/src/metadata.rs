@@ -325,4 +325,62 @@ mod unit_scenario {
         assert!(format_grpc_timeout(Duration::MAX).is_err());
         Ok(())
     }
+    #[test]
+    fn binary_padding_and_invalid_suffix_are_atomic() -> Result<(), MetadataError> {
+        use base64::engine::general_purpose::STANDARD;
+        let payload: Vec<_> = (0..=255).collect();
+        for size in 0..=payload.len() {
+            for encoded in [
+                STANDARD.encode(&payload[..size]),
+                STANDARD_NO_PAD.encode(&payload[..size]),
+            ] {
+                let mut metadata = Metadata::new();
+                metadata.append_header("all-bin", &encoded)?;
+                assert_eq!(
+                    metadata.get_all("all-bin").next(),
+                    Some(&MetadataValue::Binary(payload[..size].to_vec()))
+                );
+                for invalid in ["A", "YQ===", "_w", "YR", "YQ\n", "é"] {
+                    let original = metadata.clone();
+                    assert_eq!(
+                        metadata.append_header("all-bin", &format!("{encoded},{invalid}")),
+                        Err(MetadataError::InvalidBinaryValue),
+                        "{invalid}"
+                    );
+                    assert_eq!(metadata, original);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_boundaries_never_shorten_deadline() -> Result<(), MetadataError> {
+        for nanos in [
+            1_u128,
+            1_000,
+            1_000_000,
+            1_000_000_000,
+            60_000_000_000,
+            3_600_000_000_000,
+        ] {
+            let maximum = nanos * 99_999_999;
+            for value in [maximum - 1, maximum, maximum + 1] {
+                let duration = Duration::new(
+                    (value / 1_000_000_000) as u64,
+                    (value % 1_000_000_000) as u32,
+                );
+                if let Ok(header) = format_grpc_timeout(duration) {
+                    let decoded = parse_grpc_timeout(&header)?;
+                    assert!(decoded >= duration, "{header}");
+                    assert!(header.len() <= 9);
+                } else {
+                    assert!(value > 99_999_999 * 3_600_000_000_000);
+                }
+            }
+        }
+        assert_eq!(parse_grpc_timeout("00000001H")?, Duration::from_secs(3600));
+        assert_eq!(format_grpc_timeout(Duration::ZERO)?, "0n");
+        Ok(())
+    }
 }

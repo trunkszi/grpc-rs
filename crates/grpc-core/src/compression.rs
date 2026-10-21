@@ -1,8 +1,9 @@
 //! Per-message compression and `grpc-accept-encoding` negotiation.
 //!
-//! Zstd and LZ4 use their frame formats, Gzip uses RFC 1952, Deflate uses
-//! the RFC 1950 zlib wrapper, and Snappy uses its raw block format. Compression
-//! contexts are independent for each gRPC message.
+//! Zstd uses its frame format, LZ4 uses a single standard frame (without legacy
+//! or skippable frames), Gzip uses RFC 1952, Deflate uses the RFC 1950 zlib
+//! wrapper, and Snappy uses its raw block format. Compression contexts are
+//! independent for each gRPC message.
 
 use std::{
     io::{Read, Write},
@@ -117,12 +118,11 @@ impl CompressionAlgorithm {
                 read_bounded(decoder, max_size)
             }
             Self::Lz4 => {
-                let mut decoder = lz4_flex::frame::FrameDecoder::new(StrictFrameReader(input));
-                let output = read_bounded(&mut decoder, max_size)?;
-                if !decoder.into_inner().0.is_empty() {
-                    return Err(malformed());
-                }
-                Ok(output)
+                validate_lz4_extent(input)?;
+                read_bounded(
+                    Lz4MessageReader(lz4_flex::frame::FrameDecoder::new(StrictFrameReader(input))),
+                    max_size,
+                )
             }
             Self::Gzip => read_bounded(flate2::read::MultiGzDecoder::new(input), max_size),
             Self::Deflate => decode_deflate(input, max_size),
@@ -256,6 +256,50 @@ pub fn accept_encoding_header(algorithms: &[CompressionAlgorithm]) -> String {
 // LZ4's reader treats EOF before an end marker as a clean end of input.
 // An exhausted source must instead fail until the decoder consumes that marker.
 struct StrictFrameReader<'a>(&'a [u8]);
+
+// The upstream decoder also returns zero for a data block that produces no
+// bytes. Only the validated frame boundary establishes message completion.
+struct Lz4MessageReader<'a>(lz4_flex::frame::FrameDecoder<StrictFrameReader<'a>>);
+
+impl Read for Lz4MessageReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let count = self.0.read(output)?;
+            if count != 0 || output.is_empty() || self.0.get_ref().0.is_empty() {
+                return Ok(count);
+            }
+        }
+    }
+}
+
+// Check block extents independently of decoded byte counts. Header validity,
+// block contents, declared content size and checksums remain upstream's job.
+fn validate_lz4_extent(input: &[u8]) -> Result<(), Status> {
+    if input.get(..4) != Some(&[0x04, 0x22, 0x4d, 0x18]) {
+        return Err(malformed());
+    }
+    let flags = *input.get(4).ok_or_else(malformed)?;
+    let header_size = 7 + usize::from(flags & 8 != 0) * 8 + usize::from(flags & 1 != 0) * 4;
+    let mut remaining = input.get(header_size..).ok_or_else(malformed)?;
+    loop {
+        let header = remaining.get(..4).ok_or_else(malformed)?;
+        let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        remaining = &remaining[4..];
+        if size == 0 {
+            let checksum_size = usize::from(flags & 4 != 0) * 4;
+            return if remaining.len() == checksum_size {
+                Ok(())
+            } else {
+                Err(malformed())
+            };
+        }
+        let data_size = usize::try_from(size & 0x7fff_ffff).map_err(|_| malformed())?;
+        let block_size = data_size
+            .checked_add(usize::from(flags & 16 != 0) * 4)
+            .ok_or_else(malformed)?;
+        remaining = remaining.get(block_size..).ok_or_else(malformed)?;
+    }
+}
 
 impl Read for StrictFrameReader<'_> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
@@ -466,6 +510,121 @@ mod unit_tests {
                     encoded.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn scenario_trailing_garbage_is_not_silently_discarded() {
+        for algorithm in ALGORITHMS
+            .into_iter()
+            .filter(|a| *a != CompressionAlgorithm::Identity)
+        {
+            let encoded = algorithm.compress(b"message").unwrap();
+            for suffix in [&b"\0"[..], &b"garbage"[..], &[255; 16][..]] {
+                let mut trailing = encoded.clone();
+                trailing.extend_from_slice(suffix);
+                assert_eq!(
+                    algorithm.decompress(&trailing, 1024).unwrap_err().code(),
+                    Code::InvalidArgument,
+                    "{algorithm:?} accepted trailing {suffix:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_lz4_empty_blocks_require_end_marker_and_preserve_following_data() {
+        let algorithm = CompressionAlgorithm::Lz4;
+        let empty = algorithm.compress(b"").unwrap();
+        let following = algorithm.compress(b"following block").unwrap();
+        for block in [&[0, 0, 0, 0x80][..], &[1, 0, 0, 0, 0][..]] {
+            let mut encoded = empty[..empty.len() - 4].to_vec();
+            encoded.extend_from_slice(block);
+            assert_eq!(
+                algorithm.decompress(&encoded, 64).unwrap_err().code(),
+                Code::InvalidArgument
+            );
+            encoded.extend_from_slice(&following[7..]);
+            assert_eq!(
+                algorithm.decompress(&encoded, 64).unwrap(),
+                b"following block"
+            );
+            assert_eq!(
+                algorithm.decompress(&encoded, 14).unwrap_err().code(),
+                Code::ResourceExhausted
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_lz4_optional_fields_and_linked_blocks_round_trip() {
+        let payload = vec![b'x'; 200_000];
+        let info = lz4_flex::frame::FrameInfo::new()
+            .block_size(lz4_flex::frame::BlockSize::Max64KB)
+            .block_mode(lz4_flex::frame::BlockMode::Linked)
+            .content_size(Some(payload.len() as u64))
+            .block_checksums(true)
+            .content_checksum(true);
+        let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(info, Vec::new());
+        encoder.write_all(&payload).unwrap();
+        let encoded = encoder.finish().unwrap();
+        assert_eq!(
+            CompressionAlgorithm::Lz4
+                .decompress(&encoded, payload.len())
+                .unwrap(),
+            payload
+        );
+        for length in [encoded.len() - 1, encoded.len() - 4] {
+            assert_eq!(
+                CompressionAlgorithm::Lz4
+                    .decompress(&encoded[..length], payload.len())
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+        let first_block_size = u32::from_le_bytes(encoded[15..19].try_into().unwrap());
+        let block_checksum_offset = 19 + (first_block_size & 0x7fff_ffff) as usize;
+        for offset in [block_checksum_offset, encoded.len() - 1] {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert_eq!(
+                CompressionAlgorithm::Lz4
+                    .decompress(&corrupt, payload.len())
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_concatenated_streams_preserve_bytes_and_enforce_combined_limit() {
+        for algorithm in [CompressionAlgorithm::Zstd, CompressionAlgorithm::Gzip] {
+            let mut encoded = algorithm.compress(b"first").unwrap();
+            encoded.extend(algorithm.compress(b"second").unwrap());
+            assert_eq!(algorithm.decompress(&encoded, 11).unwrap(), b"firstsecond");
+            assert_eq!(
+                algorithm.decompress(&encoded, 10).unwrap_err().code(),
+                Code::ResourceExhausted
+            );
+            encoded.pop();
+            assert_eq!(
+                algorithm.decompress(&encoded, 11).unwrap_err().code(),
+                Code::InvalidArgument
+            );
+        }
+        for algorithm in [
+            CompressionAlgorithm::Lz4,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::Snappy,
+        ] {
+            let mut encoded = algorithm.compress(b"first").unwrap();
+            encoded.extend(algorithm.compress(b"second").unwrap());
+            assert_eq!(
+                algorithm.decompress(&encoded, 11).unwrap_err().code(),
+                Code::InvalidArgument
+            );
         }
     }
 
