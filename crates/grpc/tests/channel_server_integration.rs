@@ -13,7 +13,7 @@ use grpc::{
     server::SyncServer,
     stream::StreamError,
 };
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult = anyhow::Result<()>;
 #[derive(Clone, Default)]
 struct IntegerCodec;
 impl Codec for IntegerCodec {
@@ -442,17 +442,17 @@ fn integration_graceful_shutdown_emits_goaway_and_serve_returns() -> TestResult 
     use std::io::Read;
     let mut session = GrpcClientSession::new(SessionConfig::default())?;
     let mut buffer = [0; 8192];
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+    let result = (|| -> anyhow::Result<()> {
         while session.goaway_received().is_none() {
             let count = client.read(&mut buffer)?;
             if count == 0 {
-                return Err("peer closed without GOAWAY".into());
+                return Err(anyhow::anyhow!("peer closed without GOAWAY"));
             }
             let mut used = 0;
             while used < count {
                 let consumed = session.mem_recv(&buffer[used..count])?;
                 if consumed == 0 {
-                    return Err("HTTP/2 decoder made no progress".into());
+                    return Err(anyhow::anyhow!("HTTP/2 decoder made no progress"));
                 }
                 used += consumed;
             }

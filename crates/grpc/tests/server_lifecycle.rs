@@ -13,7 +13,7 @@ use grpc::{
         transport::{MemoryPipe, SyncTransport},
     },
 };
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult = anyhow::Result<()>;
 struct Bytes;
 impl Codec for Bytes {
     type EncodeItem = Vec<u8>;
@@ -38,10 +38,7 @@ fn wire(client: &mut GrpcClientSession) -> Result<Vec<u8>, Status> {
         wire.extend_from_slice(chunk);
     }
 }
-fn receive(
-    client: &mut GrpcClientSession,
-    pipe: &mut MemoryPipe,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn receive(client: &mut GrpcClientSession, pipe: &mut MemoryPipe) -> anyhow::Result<()> {
     let mut bytes = [0; 16384];
     loop {
         match pipe.read(&mut bytes) {

@@ -6,7 +6,7 @@ use grpc::{
     core::transport::{MemoryPipe, SyncTransport, TcpTransport, TcpTransportListener},
 };
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult = anyhow::Result<()>;
 struct Bytes;
 impl Codec for Bytes {
     type EncodeItem = Vec<u8>;
