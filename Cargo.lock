@@ -409,7 +409,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 [[package]]
 name = "nghttp2"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#032e9dc5ea4cffe28d561718e4b404f1b6ecfad4"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#a97a1d602dc1a13bdae7d2baaeb6037cd82601eb"
 dependencies = [
  "nghttp2-macros",
  "nghttp2-sys",
@@ -419,7 +419,7 @@ dependencies = [
 [[package]]
 name = "nghttp2-macros"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#032e9dc5ea4cffe28d561718e4b404f1b6ecfad4"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#a97a1d602dc1a13bdae7d2baaeb6037cd82601eb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "nghttp2-sys"
 version = "0.1.0"
-source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#032e9dc5ea4cffe28d561718e4b404f1b6ecfad4"
+source = "git+https://github.com/trunkszi/nghttp2-rs.git?branch=main#a97a1d602dc1a13bdae7d2baaeb6037cd82601eb"
 dependencies = [
  "cc",
  "cmake",
