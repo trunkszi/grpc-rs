@@ -5,7 +5,7 @@ use std::{
     io,
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use grpc_core::{
@@ -37,7 +37,6 @@ struct ServerInner<T> {
     session: GrpcServerSession,
     transport: T,
     buffer: Vec<u8>,
-    last_stream: i32,
     pending_incoming: VecDeque<(Instant, IncomingRequest)>,
     pending_reap: BTreeSet<i32>,
     reset_reap: BTreeSet<i32>,
@@ -46,41 +45,64 @@ struct ServerInner<T> {
 }
 impl<T: SyncTransport> ServerInner<T> {
     fn drive(&mut self, blocking: bool, deadline: Option<Instant>) -> Result<usize, Status> {
-        let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        if timeout.is_some_and(|duration| duration.is_zero()) {
-            return Err(Status::deadline_exceeded("request deadline elapsed"));
-        }
-        self.transport
-            .set_nonblocking(!blocking)
-            .map_err(io_status)?;
-        self.transport
-            .set_read_timeout(timeout)
-            .map_err(io_status)?;
-        self.transport
-            .set_write_timeout(timeout)
-            .map_err(io_status)?;
+        let remaining = |deadline: Option<Instant>| -> Result<Option<Duration>, Status> {
+            let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            if timeout.is_some_and(|duration| duration.is_zero()) {
+                Err(Status::deadline_exceeded("request deadline elapsed"))
+            } else {
+                Ok(timeout)
+            }
+        };
+        remaining(deadline)?;
+        self.transport.set_nonblocking(true).map_err(io_status)?;
         self.flush()?;
-        let count = loop {
+        let mut result = loop {
             match self.transport.read(&mut self.buffer) {
-                Ok(0) => {
-                    self.closed = true;
-                    return Ok(0);
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    remaining(deadline)?;
                 }
-                Ok(count) => break count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && !blocking => {
-                    return Ok(0);
+                result => break result,
+            }
+        };
+        if blocking && matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+            let mut timeout = remaining(deadline)?;
+            if self.session.want_write() {
+                let quantum = Duration::from_millis(1);
+                timeout = Some(timeout.map_or(quantum, |left| left.min(quantum)));
+            }
+            self.transport
+                .set_read_timeout(timeout)
+                .map_err(io_status)?;
+            self.transport.set_nonblocking(false).map_err(io_status)?;
+            result = loop {
+                match self.transport.read(&mut self.buffer) {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::Interrupted
+                            && deadline.is_none_or(|at| Instant::now() < at) => {}
+                    result => break result,
                 }
-                Err(error)
-                    if deadline.is_some()
-                        && matches!(
-                            error.kind(),
-                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                        ) =>
-                {
-                    return Err(Status::deadline_exceeded("request deadline elapsed"));
-                }
-                Err(error) => return Err(io_status(error)),
+            };
+            self.transport.set_nonblocking(true).map_err(io_status)?;
+        }
+        let count = match result {
+            Ok(0) => {
+                remaining(deadline)?;
+                self.closed = true;
+                return Ok(0);
+            }
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                remaining(deadline)?;
+                return Ok(0);
+            }
+            Err(error) => {
+                remaining(deadline)?;
+                return Err(io_status(error));
             }
         };
         let mut offset = 0;
@@ -95,9 +117,11 @@ impl<T: SyncTransport> ServerInner<T> {
             }
         }
         self.flush()?;
+        remaining(deadline)?;
         Ok(count)
     }
     fn flush(&mut self) -> Result<(), Status> {
+        self.transport.set_nonblocking(true).map_err(io_status)?;
         self.session.flush_to_transport(&mut self.transport)?;
         let ready: Vec<_> = self
             .pending_reap
@@ -367,7 +391,6 @@ impl<T: SyncTransport + 'static> SyncServer<T> {
                 session: GrpcServerSession::new(config)?,
                 transport,
                 buffer: vec![0; 16 * 1024],
-                last_stream: 0,
                 pending_incoming: VecDeque::new(),
                 pending_reap: BTreeSet::new(),
                 reset_reap: BTreeSet::new(),
@@ -635,10 +658,6 @@ impl<T: SyncTransport + 'static> SyncServer<T> {
             .timeout
             .map(|timeout| timeout.saturating_sub(received.elapsed()));
         let id = request.stream_id;
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.last_stream = id.max(inner.last_stream);
-        }
         if request.timeout.is_some_and(|timeout| timeout.is_zero()) {
             let mut inner = self.inner.borrow_mut();
             inner.session.finish_response(
@@ -660,7 +679,9 @@ impl<T: SyncTransport + 'static> SyncServer<T> {
                     .is_err()
                 {
                     inner.session.cancel_stream(id, 2)?;
+                    inner.reset_reap.insert(id);
                 }
+                inner.pending_reap.insert(id);
             }
         } else {
             let mut inner = self.inner.borrow_mut();
@@ -707,7 +728,7 @@ impl<T: SyncTransport + 'static> SyncServer<T> {
             {
                 let mut inner = self.inner.borrow_mut();
                 if inner.draining || inner.session.goaway_received().is_some() {
-                    inner.transport.set_nonblocking(false).map_err(io_status)?;
+                    inner.transport.set_nonblocking(true).map_err(io_status)?;
                     inner.flush()?;
                     if !inner.session.want_write() && inner.pending_reap.is_empty() {
                         inner.closed = true;
@@ -718,14 +739,15 @@ impl<T: SyncTransport + 'static> SyncServer<T> {
             }
         }
     }
-    /// Sends GOAWAY and prevents further dispatch on this connection.
+    /// Queues GOAWAY and attempts a nonblocking flush.
+    /// Continue polling or serving to drain accepted requests and pending output.
     /// # Errors
     /// Returns HTTP/2 submission or transport failures.
     pub fn shutdown_with_goaway(&mut self, error_code: u32) -> Result<(), Status> {
         let mut inner = self.inner.borrow_mut();
         inner.session.submit_goaway(error_code)?;
         inner.draining = true;
-        inner.transport.set_nonblocking(false).map_err(io_status)?;
+        inner.transport.set_nonblocking(true).map_err(io_status)?;
         inner.flush()?;
         Ok(())
     }

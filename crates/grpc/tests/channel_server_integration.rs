@@ -75,6 +75,10 @@ fn register<T: SyncTransport + 'static>(server: &mut SyncServer<T>) -> Result<()
         }
         Ok(())
     })?;
+    server.register_bidi_streaming("/test.Echo/Early", IntegerCodec, |_requests, sink| {
+        sink.send(&77).map_err(stream_status)?;
+        Ok(())
+    })?;
     server.register_unary("/test.Echo/Denied", IntegerCodec, |_| {
         Err(Status::permission_denied("policy rejection"))
     })?;
@@ -386,7 +390,17 @@ impl Codec for WrongContentCodec {
 #[test]
 fn integration_wrong_content_type_rejected_before_codec_and_connection_recovers() -> TestResult {
     let (client, server) = MemoryPipe::pair();
-    let worker = spawn_server(server);
+    let worker = thread::spawn(move || {
+        let mut server = SyncServer::with_config(
+            server,
+            grpc::SessionConfig {
+                max_active_streams: 1,
+                ..Default::default()
+            },
+        )?;
+        register(&mut server)?;
+        server.serve_connection()
+    });
     let result = (|| -> TestResult {
         let mut channel = SyncChannel::with_config(
             client,
@@ -395,14 +409,16 @@ fn integration_wrong_content_type_rejected_before_codec_and_connection_recovers(
                 ..ChannelConfig::default()
             },
         )?;
-        let error = channel
-            .call_unary("/test.Echo/Unary", &5, &mut WrongContentCodec)
-            .expect_err("codec content type mismatch must fail");
-        assert_eq!(error.code(), Code::Unimplemented);
-        assert_eq!(
-            channel.call_unary("/test.Echo/Unary", &5, &mut IntegerCodec)?,
-            6
-        );
+        for _ in 0..8 {
+            let error = channel
+                .call_unary("/test.Echo/Unary", &5, &mut WrongContentCodec)
+                .expect_err("codec content type mismatch must fail");
+            assert_eq!(error.code(), Code::Unimplemented);
+            assert_eq!(
+                channel.call_unary("/test.Echo/Unary", &5, &mut IntegerCodec)?,
+                6
+            );
+        }
         Ok(())
     })();
     let served = worker.join().expect("server worker must not panic");
@@ -445,6 +461,310 @@ fn integration_graceful_shutdown_emits_goaway_and_serve_returns() -> TestResult 
         Ok(())
     })();
     drop(client);
+    let served = worker.join().expect("server worker must not panic");
+    result?;
+    served?;
+    Ok(())
+}
+
+struct DropCallCodec {
+    abandoned: std::rc::Rc<std::cell::RefCell<Option<grpc::BidiStreamingCall<u32, u32>>>>,
+}
+impl Codec for DropCallCodec {
+    type EncodeItem = u32;
+    type DecodeItem = u32;
+    type Error = io::Error;
+    const CONTENT_TYPE: &'static str = IntegerCodec::CONTENT_TYPE;
+    fn encode(&mut self, value: &u32, destination: &mut Vec<u8>) -> io::Result<()> {
+        IntegerCodec.encode(value, destination)
+    }
+    fn decode(&mut self, payload: &[u8]) -> io::Result<u32> {
+        drop(self.abandoned.borrow_mut().take());
+        IntegerCodec.decode(payload)
+    }
+}
+
+#[test]
+fn integration_codec_callback_drops_other_call_without_leaking_stream_capacity() -> TestResult {
+    use std::{cell::RefCell, rc::Rc};
+
+    use grpc::core::session::SessionConfig;
+    let (client, transport) = MemoryPipe::pair();
+    let worker = thread::spawn(move || -> Result<(), Status> {
+        let mut server = SyncServer::with_config(
+            transport,
+            SessionConfig {
+                max_active_streams: 2,
+                ..SessionConfig::default()
+            },
+        )?;
+        register(&mut server)?;
+        server.serve_connection()
+    });
+    let result = (|| -> TestResult {
+        let mut channel = SyncChannel::with_config(
+            client,
+            ChannelConfig {
+                default_timeout: Some(Duration::from_secs(5)),
+                session_config: SessionConfig {
+                    max_active_streams: 2,
+                    ..SessionConfig::default()
+                },
+                ..ChannelConfig::default()
+            },
+        )?;
+        let abandoned = Rc::new(RefCell::new(Some(channel.bidi_streaming(
+            "/test.Echo/Early",
+            IntegerCodec,
+            CallOptions::default(),
+        )?)));
+        let mut responses = channel.server_streaming(
+            "/test.Echo/Server",
+            &10,
+            DropCallCodec {
+                abandoned: Rc::clone(&abandoned),
+            },
+            CallOptions::default(),
+        )?;
+        assert_eq!(responses.finish()?, [10, 11]);
+        assert!(abandoned.borrow().is_none());
+        drop(responses);
+        let pending =
+            channel.bidi_streaming("/test.Echo/Early", IntegerCodec, CallOptions::default())?;
+        // This second live slot must fit: the callback released the older call.
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &20, &mut IntegerCodec)?,
+            21
+        );
+        drop(pending);
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &30, &mut IntegerCodec)?,
+            31
+        );
+        Ok(())
+    })();
+    let served = worker.join().expect("server worker must not panic");
+    result?;
+    served?;
+    Ok(())
+}
+
+struct SlowCodec {
+    encode_delay: bool,
+    decode_delay: bool,
+    entered: std::rc::Rc<std::cell::Cell<bool>>,
+}
+impl Codec for SlowCodec {
+    type EncodeItem = u32;
+    type DecodeItem = u32;
+    type Error = io::Error;
+    const CONTENT_TYPE: &'static str = IntegerCodec::CONTENT_TYPE;
+    fn encode(&mut self, value: &u32, destination: &mut Vec<u8>) -> io::Result<()> {
+        if self.encode_delay {
+            self.entered.set(true);
+            thread::sleep(Duration::from_millis(70));
+        }
+        IntegerCodec.encode(value, destination)
+    }
+    fn decode(&mut self, payload: &[u8]) -> io::Result<u32> {
+        if self.decode_delay {
+            self.entered.set(true);
+            thread::sleep(Duration::from_millis(70));
+        }
+        IntegerCodec.decode(payload)
+    }
+}
+
+#[test]
+fn integration_unary_deadline_includes_codec_encode_and_decode_work() -> TestResult {
+    use std::{cell::Cell, rc::Rc};
+    let (client, transport) = MemoryPipe::pair();
+    let worker = spawn_server(transport);
+    let result = (|| -> TestResult {
+        let mut channel = SyncChannel::with_config(
+            client,
+            ChannelConfig {
+                default_timeout: Some(Duration::from_secs(5)),
+                ..ChannelConfig::default()
+            },
+        )?;
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &0, &mut IntegerCodec)?,
+            1
+        );
+        for encode_delay in [true, false] {
+            let entered = Rc::new(Cell::new(false));
+            let mut codec = SlowCodec {
+                encode_delay,
+                decode_delay: !encode_delay,
+                entered: Rc::clone(&entered),
+            };
+            let error = channel
+                .unary(
+                    "/test.Echo/Unary",
+                    &2,
+                    &mut codec,
+                    CallOptions {
+                        timeout: Some(Duration::from_millis(10)),
+                        ..CallOptions::default()
+                    },
+                )
+                .expect_err("codec work must not extend an expired RPC deadline");
+            assert!(
+                entered.get(),
+                "the delayed codec branch must actually execute"
+            );
+            assert_eq!(error.code(), Code::DeadlineExceeded);
+            assert_eq!(
+                channel.call_unary("/test.Echo/Unary", &3, &mut IntegerCodec)?,
+                4
+            );
+        }
+        Ok(())
+    })();
+    let served = worker.join().expect("server worker must not panic");
+    result?;
+    served?;
+    Ok(())
+}
+
+#[test]
+fn integration_streaming_deadline_includes_codec_decode_and_send_work() -> TestResult {
+    use std::{cell::Cell, rc::Rc};
+    let (client, transport) = MemoryPipe::pair();
+    let worker = spawn_server(transport);
+    let result = (|| -> TestResult {
+        let mut channel = SyncChannel::with_config(
+            client,
+            ChannelConfig {
+                default_timeout: Some(Duration::from_secs(5)),
+                ..ChannelConfig::default()
+            },
+        )?;
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &0, &mut IntegerCodec)?,
+            1
+        );
+        let decoded = Rc::new(Cell::new(false));
+        let mut responses = channel.server_streaming(
+            "/test.Echo/Server",
+            &7,
+            SlowCodec {
+                encode_delay: false,
+                decode_delay: true,
+                entered: Rc::clone(&decoded),
+            },
+            CallOptions {
+                timeout: Some(Duration::from_millis(10)),
+                ..CallOptions::default()
+            },
+        )?;
+        let error = responses
+            .recv_next()
+            .expect_err("slow decoder must not return late success");
+        assert!(decoded.get());
+        assert!(
+            matches!(error, StreamError::Status(status) if status.code() == Code::DeadlineExceeded)
+        );
+        drop(responses);
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &1, &mut IntegerCodec)?,
+            2
+        );
+        let encoded = Rc::new(Cell::new(false));
+        let mut requests = channel.bidi_streaming(
+            "/test.Echo/Bidi",
+            SlowCodec {
+                encode_delay: true,
+                decode_delay: false,
+                entered: Rc::clone(&encoded),
+            },
+            CallOptions {
+                timeout: Some(Duration::from_millis(10)),
+                ..CallOptions::default()
+            },
+        )?;
+        let error = requests
+            .send(&9)
+            .expect_err("slow encoder must not return late success");
+        assert!(encoded.get());
+        assert!(
+            matches!(error, StreamError::Status(status) if status.code() == Code::DeadlineExceeded)
+        );
+        drop(requests);
+        assert_eq!(
+            channel.call_unary("/test.Echo/Unary", &2, &mut IntegerCodec)?,
+            3
+        );
+        Ok(())
+    })();
+    let served = worker.join().expect("server worker must not panic");
+    result?;
+    served?;
+    Ok(())
+}
+
+struct ByteVecCodec;
+impl Codec for ByteVecCodec {
+    type EncodeItem = Vec<u8>;
+    type DecodeItem = Vec<u8>;
+    type Error = io::Error;
+    const CONTENT_TYPE: &'static str = "application/grpc+bytes";
+    fn encode(&mut self, value: &Vec<u8>, destination: &mut Vec<u8>) -> io::Result<()> {
+        destination.extend_from_slice(value);
+        Ok(())
+    }
+    fn decode(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        Ok(payload.to_vec())
+    }
+}
+
+#[test]
+fn integration_duplex_backpressure_drains_both_directions_on_tiny_pipe() -> TestResult {
+    let (client, transport) = MemoryPipe::with_capacity(1024)?;
+    let worker = thread::spawn(move || -> Result<(), Status> {
+        let mut server = SyncServer::new(transport)?;
+        server.register_bidi_streaming(
+            "/test.Bytes/Duplex",
+            ByteVecCodec,
+            |mut requests, sink| {
+                for expected in [1_u8, 2] {
+                    let message = requests
+                        .recv_next()
+                        .map_err(stream_status)?
+                        .ok_or_else(|| Status::internal("missing duplex request"))?;
+                    if message != vec![expected; 4096] {
+                        return Err(Status::invalid_argument("incorrect duplex payload"));
+                    }
+                    sink.send(&message).map_err(stream_status)?;
+                }
+                if requests.recv_next().map_err(stream_status)?.is_some() {
+                    return Err(Status::invalid_argument("unexpected third duplex request"));
+                }
+                Ok(())
+            },
+        )?;
+        server.serve_connection()
+    });
+    let result = (|| -> TestResult {
+        let mut channel = SyncChannel::new(client)?;
+        let mut call = channel.bidi_streaming(
+            "/test.Bytes/Duplex",
+            ByteVecCodec,
+            CallOptions {
+                timeout: Some(Duration::from_secs(2)),
+                ..CallOptions::default()
+            },
+        )?;
+        // Both sends precede any receive; neither pipe direction can hold a frame.
+        call.send(&vec![1; 4096])?;
+        call.send(&vec![2; 4096])?;
+        call.half_close()?;
+        assert_eq!(call.recv_next()?, Some(vec![1; 4096]));
+        assert_eq!(call.recv_next()?, Some(vec![2; 4096]));
+        assert_eq!(call.recv_next()?, None);
+        Ok(())
+    })();
     let served = worker.join().expect("server worker must not panic");
     result?;
     served?;

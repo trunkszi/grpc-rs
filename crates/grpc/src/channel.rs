@@ -1,5 +1,11 @@
 //! Caller-thread client channels with shared HTTP/2 sessions and typed RPC streams.
-use std::{cell::RefCell, collections::BTreeSet, io, rc::Rc, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::BTreeSet,
+    io,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use grpc_core::{
     Code, Codec, CompressionAlgorithm, GrpcClientSession, Metadata, SessionConfig, Status, Timeout,
@@ -51,47 +57,87 @@ struct ChannelInner<T: SyncTransport> {
     config: ChannelConfig,
     cleanup_error: Option<Status>,
     pending_reap: BTreeSet<i32>,
+    pending_cancellations: Rc<RefCell<Vec<i32>>>,
 }
 impl<T: SyncTransport> ChannelInner<T> {
     fn pump(&mut self, wait: bool, deadline: Option<Instant>) -> Result<(), Status> {
-        let remaining = deadline
-            .map(|end| {
-                end.checked_duration_since(Instant::now())
-                    .filter(|n| !n.is_zero())
-                    .ok_or_else(|| Status::deadline_exceeded("RPC deadline elapsed"))
-            })
-            .transpose()?;
-        self.transport.set_nonblocking(!wait).map_err(io_status)?;
-        let result = (|| {
-            if wait {
-                self.transport
-                    .set_read_timeout(remaining)
-                    .map_err(io_status)?;
-                self.transport
-                    .set_write_timeout(remaining)
-                    .map_err(io_status)?;
+        check_deadline(deadline)?;
+        self.transport.set_nonblocking(true).map_err(io_status)?;
+        self.flush()?;
+        let mut read = loop {
+            match self.transport.read(&mut self.buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    check_deadline(deadline)?;
+                }
+                result => break result,
             }
-            self.session
-                .step_transport(&mut self.transport, &mut self.buffer)
-                .map(|_| ())
-        })();
-        let restored = self.transport.set_nonblocking(true).map_err(io_status);
-        if deadline.is_some_and(|end| Instant::now() >= end) {
-            return Err(Status::deadline_exceeded("RPC deadline elapsed"));
+        };
+        if matches!(&read, Err(error) if error.kind() == io::ErrorKind::WouldBlock) && wait {
+            let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            check_deadline(deadline)?;
+            let timeout = if self.session.want_write() {
+                Some(remaining.map_or(Duration::from_millis(1), |left| {
+                    left.min(Duration::from_millis(1))
+                }))
+            } else {
+                remaining
+            };
+            self.transport
+                .set_read_timeout(timeout)
+                .map_err(io_status)?;
+            self.transport.set_nonblocking(false).map_err(io_status)?;
+            read = self.transport.read(&mut self.buffer);
+            let restored = self.transport.set_nonblocking(true).map_err(io_status);
+            restored?;
         }
-        result.and(restored)?;
-        self.reap()
+        let count = match read {
+            Ok(0) => return Err(Status::unavailable("transport EOF")),
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                check_deadline(deadline)?;
+                return self.reap();
+            }
+            Err(error) => return Err(io_status(error)),
+        };
+        let mut offset = 0;
+        while offset < count {
+            let used = self.session.mem_recv(&self.buffer[offset..count])?;
+            if used == 0 {
+                return Err(Status::internal("HTTP/2 receive made no progress"));
+            }
+            offset += used;
+        }
+        self.flush()?;
+        check_deadline(deadline)
     }
-    fn cleanup(&mut self, id: i32) {
-        let reset = self.session.cancel_stream(id, 8);
-        self.pending_reap.insert(id);
-        if let Err(error) = self.flush() {
-            self.cleanup_error = Some(error);
-        } else if self.pending_reap.contains(&id)
-            && let Err(error) = reset
-        {
-            self.cleanup_error = Some(error);
+    fn drain_cancellations(&mut self) -> Result<(), Status> {
+        let ids = std::mem::take(&mut *self.pending_cancellations.borrow_mut());
+        for id in ids {
+            let reset = self.session.cancel_stream(id, 8);
+            self.pending_reap.insert(id);
+            if let Err(reset_error) = reset {
+                match self.session.remove_closed_stream(id) {
+                    Ok(()) => {
+                        self.pending_reap.remove(&id);
+                    }
+                    Err(error) if error.code() == Code::NotFound => {
+                        self.pending_reap.remove(&id);
+                    }
+                    Err(_) => {
+                        self.cleanup_error = Some(reset_error.clone());
+                        return Err(reset_error);
+                    }
+                }
+            }
         }
+        Ok(())
     }
     fn reap(&mut self) -> Result<(), Status> {
         let ids: Vec<_> = self.pending_reap.iter().copied().collect();
@@ -113,6 +159,7 @@ impl<T: SyncTransport> ChannelInner<T> {
         Ok(())
     }
     fn flush(&mut self) -> Result<(), Status> {
+        self.drain_cancellations()?;
         self.session.flush_to_transport(&mut self.transport)?;
         self.reap()
     }
@@ -177,8 +224,24 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
                 config,
                 cleanup_error: None,
                 pending_reap: BTreeSet::new(),
+                pending_cancellations: Rc::new(RefCell::new(Vec::new())),
             })),
         })
+    }
+    fn deadline(&self, options: &CallOptions) -> Result<Option<Instant>, Status> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| Status::failed_precondition("reentrant channel access"))?;
+        options
+            .timeout
+            .or(inner.config.default_timeout)
+            .map(|duration| {
+                Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| Status::invalid_argument("RPC deadline overflow"))
+            })
+            .transpose()
     }
     fn start<C: Codec>(
         &mut self,
@@ -186,26 +249,35 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
         codec: C,
         options: CallOptions,
         content_type: &str,
+        absolute_deadline: Option<Option<Instant>>,
     ) -> Result<ChannelStreamDriver<T, C>, Status> {
         let mut inner = self
             .inner
             .try_borrow_mut()
             .map_err(|_| Status::failed_precondition("reentrant channel access"))?;
-        inner.reap()?;
+        inner.flush()?;
         if let Some(error) = &inner.cleanup_error {
             return Err(error.clone());
         }
-        let timeout = options.timeout.or(inner.config.default_timeout);
-        let deadline = timeout
-            .map(|duration| {
-                Instant::now()
-                    .checked_add(duration)
-                    .ok_or_else(|| Status::invalid_argument("RPC deadline overflow"))
+        let deadline = match absolute_deadline {
+            Some(deadline) => deadline,
+            None => options
+                .timeout
+                .or(inner.config.default_timeout)
+                .map(|duration| {
+                    Instant::now()
+                        .checked_add(duration)
+                        .ok_or_else(|| Status::invalid_argument("RPC deadline overflow"))
+                })
+                .transpose()?,
+        };
+        let timeout = deadline
+            .map(|end| {
+                end.checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| Status::deadline_exceeded("RPC deadline elapsed"))
             })
             .transpose()?;
-        if timeout.is_some_and(|duration| duration.is_zero()) {
-            return Err(Status::deadline_exceeded("RPC deadline elapsed"));
-        }
         let encoding = options
             .compression
             .unwrap_or(inner.config.default_compression);
@@ -230,6 +302,7 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
             complete: false,
             closed: false,
             buffer: Vec::new(),
+            pending_cancellations: Rc::clone(&inner.pending_cancellations),
         })
     }
     /// Performs a unary RPC, returning its response and both metadata collections.
@@ -247,9 +320,12 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
     where
         C: Codec<EncodeItem = Req, DecodeItem = Resp>,
     {
+        let deadline = self.deadline(&options)?;
+        check_deadline(deadline)?;
         let mut payload = Vec::new();
         codec.encode(req, &mut payload).map_err(codec_status)?;
-        let mut driver = self.start(path, BytesCodec, options, C::CONTENT_TYPE)?;
+        check_deadline(deadline)?;
+        let mut driver = self.start(path, BytesCodec, options, C::CONTENT_TYPE, Some(deadline))?;
         driver.send(&payload).map_err(status_only)?;
         driver.half_close().map_err(status_only)?;
         let mut response = None;
@@ -268,6 +344,7 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
         }
         let bytes = response.ok_or_else(|| Status::internal("missing unary response"))?;
         let response = codec.decode(bytes.payload()).map_err(codec_status)?;
+        check_deadline(deadline)?;
         Ok((
             response,
             driver.initial.take().unwrap_or_default(),
@@ -304,7 +381,7 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
         Req: 'static,
         Resp: 'static,
     {
-        let mut driver = self.start(path, codec, options, C::CONTENT_TYPE)?;
+        let mut driver = self.start(path, codec, options, C::CONTENT_TYPE, None)?;
         driver.send(req).map_err(status_only)?;
         driver.half_close().map_err(status_only)?;
         Ok(ServerStreamingCall::new(driver))
@@ -328,6 +405,7 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
             codec,
             options,
             C::CONTENT_TYPE,
+            None,
         )?))
     }
     /// Starts independent request and response streams.
@@ -349,6 +427,7 @@ impl<T: SyncTransport + 'static> SyncChannel<T> {
             codec,
             options,
             C::CONTENT_TYPE,
+            None,
         )?))
     }
 }
@@ -431,14 +510,11 @@ pub struct ChannelStreamDriver<T: SyncTransport, C: Codec> {
     complete: bool,
     closed: bool,
     buffer: Vec<u8>,
+    pending_cancellations: Rc<RefCell<Vec<i32>>>,
 }
 impl<T: SyncTransport, C: Codec> ChannelStreamDriver<T, C> {
     fn check_deadline(&self) -> Result<(), StreamError> {
-        if self.deadline.is_some_and(|end| Instant::now() >= end) {
-            Err(Status::deadline_exceeded("RPC deadline elapsed").into())
-        } else {
-            Ok(())
-        }
+        check_deadline(self.deadline).map_err(Into::into)
     }
     fn receive(&mut self) -> Result<Option<C::DecodeItem>, StreamError> {
         let mut inner = self
@@ -449,11 +525,10 @@ impl<T: SyncTransport, C: Codec> ChannelStreamDriver<T, C> {
             self.initial = inner.session.pop_initial_metadata(self.id)?;
         }
         if let Some(message) = inner.session.pop_message(self.id)? {
-            return self
-                .codec
-                .decode(message.payload())
-                .map(Some)
-                .map_err(|error| codec_status(error).into());
+            drop(inner);
+            let value = self.codec.decode(message.payload()).map_err(codec_status)?;
+            self.check_deadline()?;
+            return Ok(Some(value));
         }
         if let Some((status, trailers)) = inner.session.take_trailers(self.id)? {
             self.trailing = Some(trailers);
@@ -488,6 +563,7 @@ where
         self.codec
             .encode(message, &mut self.buffer)
             .map_err(codec_status)?;
+        self.check_deadline()?;
         let mut inner = self
             .inner
             .try_borrow_mut()
@@ -548,8 +624,11 @@ where
         if self.complete {
             return;
         }
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.cleanup(self.id);
+        self.pending_cancellations.borrow_mut().push(self.id);
+        if let Ok(mut inner) = self.inner.try_borrow_mut()
+            && let Err(error) = inner.flush()
+        {
+            inner.cleanup_error = Some(error);
         }
         self.complete = true;
     }
@@ -560,8 +639,18 @@ impl<T: SyncTransport, C: Codec> Drop for ChannelStreamDriver<T, C> {
         if self.complete {
             return;
         }
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.cleanup(self.id);
+        self.pending_cancellations.borrow_mut().push(self.id);
+        if let Ok(mut inner) = self.inner.try_borrow_mut()
+            && let Err(error) = inner.flush()
+        {
+            inner.cleanup_error = Some(error);
         }
+    }
+}
+fn check_deadline(deadline: Option<Instant>) -> Result<(), Status> {
+    if deadline.is_some_and(|at| Instant::now() >= at) {
+        Err(Status::deadline_exceeded("RPC deadline elapsed"))
+    } else {
+        Ok(())
     }
 }
