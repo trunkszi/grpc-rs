@@ -37,8 +37,17 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential cmake pkg-config libclang-dev libnghttp2-dev protobuf-compiler capnproto
+          sudo apt-get install --yes build-essential cmake pkg-config libclang-dev libnghttp2-dev protobuf-compiler capnproto python3-venv
           python3 -c 'import tomllib'
+
+      - name: Install Apache Fory schema compiler
+        run: |
+          python3 -m venv "$GRPC_CI_RUN_DIR/foryc-venv"
+          "$GRPC_CI_RUN_DIR/foryc-venv/bin/python" -m pip install 'git+https://github.com/apache/fory.git@main#subdirectory=compiler'
+          "$GRPC_CI_RUN_DIR/foryc-venv/bin/foryc" --help
+          echo "$GRPC_CI_RUN_DIR/foryc-venv/bin" >> "$GITHUB_PATH"
+          echo "FORYC=$GRPC_CI_RUN_DIR/foryc-venv/bin/foryc" >> "$GITHUB_ENV"
+          echo 'GRPC_BUILD_REQUIRE_FORYC=1' >> "$GITHUB_ENV"
 
       - name: Put Rust on PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
