@@ -116,6 +116,14 @@ impl<E: Owned, D: Owned> Codec for CapnpCodec<E, D> {
     }
 
     fn decode(&mut self, payload: &[u8]) -> capnp::Result<Self::DecodeItem> {
+        // Validate declared body lengths before allocating owned segment storage.
+        // The framing-only preflight does not dereference unaligned message words.
+        let mut preflight = payload;
+        drop(capnp::serialize::read_message_from_flat_slice(
+            &mut preflight,
+            self.options,
+        )?);
+        require_consumed(preflight)?;
         let mut remaining = payload;
         let reader = capnp::serialize::read_message(&mut remaining, self.options)?;
         require_consumed(remaining)?;
@@ -343,6 +351,68 @@ mod unit {
     }
 
     #[test]
+    fn scenario_rejects_far_pointers_outside_declared_segments() {
+        for pointer in [(1_u64 << 32) | 2, (1 << 3) | 2, 6, 2] {
+            let mut payload = [0_u8; 16];
+            payload[4..8].copy_from_slice(&1_u32.to_le_bytes());
+            payload[8..].copy_from_slice(&pointer.to_le_bytes());
+            rejects_both(&payload);
+        }
+    }
+
+    #[test]
+    fn scenario_segment_count_limit_matches_owned_and_borrowed_reading() {
+        let count = capnp::serialize::SEGMENTS_COUNT_LIMIT - 1;
+        let table_bytes = (count / 2 + 1) * 8;
+        let mut payload = vec![0_u8; table_bytes + 8];
+        payload[..4].copy_from_slice(&u32::try_from(count - 1).unwrap().to_le_bytes());
+        payload[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        let words = aligned(&payload);
+        let mut codec = DataCodec::new();
+        assert!(codec.decode(&payload).unwrap().get().unwrap().is_empty());
+        assert!(
+            codec
+                .read_aligned(Word::words_to_bytes(&words))
+                .unwrap()
+                .get()
+                .unwrap()
+                .is_empty()
+        );
+
+        payload[..4].copy_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        rejects_both(&payload);
+    }
+
+    #[test]
+    fn scenario_repeated_root_access_consumes_each_readers_own_budget() {
+        let payload = encoded_data(b"one word");
+        let words = aligned(&payload);
+        let input = Word::words_to_bytes(&words);
+        // Each root access reads the pointer word and the data word, including
+        // the validation performed while constructing each typed reader.
+        let mut codec = DataCodec::with_limits(4, 8).unwrap();
+        let owned = codec.decode(input).unwrap();
+        let borrowed = codec.read_aligned(input).unwrap();
+
+        assert_eq!(owned.get().unwrap(), b"one word");
+        assert_eq!(borrowed.get().unwrap(), b"one word");
+        assert_eq!(
+            owned.get().unwrap_err().kind,
+            capnp::ErrorKind::ReadLimitExceeded
+        );
+        assert_eq!(
+            borrowed.get().unwrap_err().kind,
+            capnp::ErrorKind::ReadLimitExceeded
+        );
+
+        assert_eq!(codec.decode(input).unwrap().get().unwrap(), b"one word");
+        assert_eq!(
+            codec.read_aligned(input).unwrap().get().unwrap(),
+            b"one word"
+        );
+    }
+
+    #[test]
     fn scenario_enforces_configured_word_limits() {
         let encoded = encoded_data(&[42; 64]);
         let words = aligned(&encoded);
@@ -413,6 +483,25 @@ mod unit {
             assert_eq!(inner.len(), 1);
             assert_eq!(inner.get(0), 42);
         }
+    }
+
+    #[test]
+    fn scenario_preflights_body_at_allocation_limit() {
+        let words = ReaderOptions::new().traversal_limit_in_words.unwrap();
+        let mut header = [0_u8; 8];
+        header[4..].copy_from_slice(&(words as u32).to_le_bytes());
+        let error = DataCodec::new().decode(&header).err().unwrap();
+        assert_eq!(
+            error.kind,
+            capnp::ErrorKind::MessageEndsPrematurely(words, 0)
+        );
+        let mut unaligned = [0_u8; 9];
+        unaligned[1..].copy_from_slice(&header);
+        let error = DataCodec::new().decode(&unaligned[1..]).err().unwrap();
+        assert_eq!(
+            error.kind,
+            capnp::ErrorKind::MessageEndsPrematurely(words, 0)
+        );
     }
 
     #[test]
