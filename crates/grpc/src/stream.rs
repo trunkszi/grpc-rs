@@ -1,37 +1,18 @@
 //! Synchronous streaming calls over a caller-thread I/O driver.
 //! Drivers handle transport, framing and codecs; handles enforce RPC lifecycle
 //! and cardinality without creating threads or an executor.
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use grpc_core::{Metadata, Status};
 /// A pending operation or a terminal RPC failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum StreamError {
     /// No message or transport capacity is available without waiting.
+    #[error("stream would block")]
     WouldBlock,
     /// Terminal local, transport or remote gRPC status.
-    Status(Status),
-}
-impl fmt::Display for StreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WouldBlock => f.write_str("stream would block"),
-            Self::Status(s) => s.fmt(f),
-        }
-    }
-}
-impl std::error::Error for StreamError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Status(s) => Some(s),
-            Self::WouldBlock => None,
-        }
-    }
-}
-impl From<Status> for StreamError {
-    fn from(s: Status) -> Self {
-        Self::Status(s)
-    }
+    #[error("{0}")]
+    Status(#[from] Status),
 }
 type Result<T> = std::result::Result<T, StreamError>;
 fn invalid(message: &str) -> StreamError {

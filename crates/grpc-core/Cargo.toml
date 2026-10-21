@@ -7,6 +7,7 @@ license.workspace = true
 repository = { workspace = true }
 
 [dependencies]
+thiserror = { workspace = true }
 zstd = { workspace = true }
 lz4_flex = { workspace = true }
 flate2 = { workspace = true }

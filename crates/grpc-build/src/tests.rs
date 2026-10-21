@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, process, time::SystemTime};
 use super::{SchemaCompiler, SchemaKind, render_service_module};
 const PROTO: &str = r#"syntax = "proto3"; package demo.v1; service Echo { rpc Unary (Ping) returns (Pong); rpc Server (Ping) returns (stream Pong); rpc Client (stream Ping) returns (Pong); rpc Bidi (stream Ping) returns (stream Pong); } message Ping { string text = 1; } message Pong { string text = 1; }"#;
 const FDL: &str = r#"package demo.v1; message Ping {} message Pong {} service Echo { rpc Unary (Ping) returns (Pong); rpc Server (Ping) returns (stream Pong); rpc Client (stream Ping) returns (Pong); rpc Bidi (stream Ping) returns (stream Pong); }"#;
-const CAPNP: &str = r#"@0x9a2b3c4d5e6f7081; $Rust.parentModule("demo.v1"); struct Ping { text @0 :Text; } struct Pong { text @0 :Text; } interface Echo { unary @0 (request :Ping) -> (response :Pong); server @1 (request :Ping) -> (response :stream Pong); client @2 (request :stream Ping) -> (response :Pong); bidi @3 (request :stream Ping) -> (response :stream Pong); }"#;
+const CAPNP: &str = r#"@0x9a2b3c4d5e6f7081; struct Rust { annotation parentModule @0xabee386cd1450364 (file) :Text; } $Rust.parentModule("demo"); annotation clientStreaming(method) :Void; annotation serverStreaming(method) :Void; struct Ping { text @0 :Text; } struct Pong { text @0 :Text; } interface Echo { unary @0 (request :Ping) -> (response :Pong); server @1 (request :Ping) -> (response :Pong) $serverStreaming; client @2 (request :Ping) -> (response :Pong) $clientStreaming; bidi @3 (request :Ping) -> (response :Pong) $clientStreaming $serverStreaming; }"#;
 fn scratch(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -23,33 +23,39 @@ fn lowers_proto_fdl_capnp_and_dotted_types() {
         has(&rust, "package = \"demo.v1\"");
         has(
             &rust,
-            "#[server_streaming]\n        fn Server(Ping) -> Pong;",
+            "#[server_streaming]\n        fn Server(request: Ping) -> Pong;",
         );
         has(
             &rust,
-            "#[client_streaming]\n        fn Client(Ping) -> Pong;",
+            "#[client_streaming]\n        fn Client(request: Ping) -> Pong;",
         );
-        has(&rust, "#[bidi_streaming]\n        fn Bidi(Ping) -> Pong;");
-        has(&rust, "fn Unary(Ping) -> Pong;");
+        has(
+            &rust,
+            "#[bidi_streaming]\n        fn Bidi(request: Ping) -> Pong;",
+        );
+        has(&rust, "fn Unary(request: Ping) -> Pong;");
     }
     let dotted =
         "package demo.v1; service Echo { rpc Unary (foo.bar.Ping) returns (foo.bar.Pong); }";
     has(
         &render_service_module(SchemaKind::Proto, dotted).expect("dotted"),
-        "fn Unary(foo::bar::Ping) -> foo::bar::Pong;",
+        "fn Unary(request: foo::bar::Ping) -> foo::bar::Pong;",
     );
     let capnp = render_service_module(SchemaKind::Capnp, CAPNP).expect("capnp");
     has(
         &capnp,
-        "#[server_streaming]\n        fn server(Ping) -> Pong;",
+        "#[server_streaming]\n        fn server(request: Ping) -> Pong;",
     );
     has(
         &capnp,
-        "#[client_streaming]\n        fn client(Ping) -> Pong;",
+        "#[client_streaming]\n        fn client(request: Ping) -> Pong;",
     );
-    has(&capnp, "#[bidi_streaming]\n        fn bidi(Ping) -> Pong;");
-    has(&capnp, "fn unary(Ping) -> Pong;");
-    has(&capnp, "package = \"demo.v1\"");
+    has(
+        &capnp,
+        "#[bidi_streaming]\n        fn bidi(request: Ping) -> Pong;",
+    );
+    has(&capnp, "fn unary(request: Ping) -> Pong;");
+    has(&capnp, "package = \"demo\"");
 }
 #[test]
 fn covers_schema_edges() {
@@ -57,18 +63,18 @@ fn covers_schema_edges() {
                   Unary (Ping) returns (Pong); }";
     let rust = render_service_module(SchemaKind::Proto, buried).expect("buried");
     assert_eq!(rust.matches("pub trait").count(), 1, "{rust}");
-    has(&rust, "fn Unary(Ping) -> Pong;");
+    has(&rust, "fn Unary(request: Ping) -> Pong;");
     let lead = "service Echo { rpc Unary (.demo.v1.Ping) returns (stream .demo.v1.Pong); }";
     has(
         &render_service_module(SchemaKind::Proto, lead).expect("lead"),
-        "#[server_streaming]\n        fn Unary(demo::v1::Ping) -> demo::v1::Pong;",
+        "#[server_streaming]\n        fn Unary(request: demo::v1::Ping) -> demo::v1::Pong;",
     );
     let named = render_service_module(
         SchemaKind::Proto,
         "service Echo { rpc Unary (stream) returns (Pong); }",
     )
     .expect("stream type");
-    has(&named, "fn Unary(stream) -> Pong;");
+    has(&named, "fn Unary(request: stream) -> Pong;");
     assert!(!named.contains("streaming"), "{named}");
     has(
         &render_service_module(
@@ -92,7 +98,7 @@ fn covers_schema_edges() {
             "import 'api/service.fdl'; service Echo { rpc Unary (Ping) returns (Pong); }",
         )
         .expect("quotes"),
-        "fn Unary(Ping) -> Pong;",
+        "fn Unary(request: Ping) -> Pong;",
     );
     let cap = "# interface Old { foo @0 (x :Ping) -> (y :Pong); }\nstruct Box { interface Inner { \
                hidden @0 (q :Ping) -> (r :Pong); } }\ninterface Echo {\n# }\nunary @0 (stream \
@@ -101,15 +107,21 @@ fn covers_schema_edges() {
                ();\n}\n$Rust.parentModule(\"demo.v1\");\n";
     let rust = render_service_module(SchemaKind::Capnp, cap).expect("capnp edges");
     assert!(!rust.contains("fn foo("), "{rust}");
-    has(&rust, "fn hidden(Ping) -> Pong;");
+    has(&rust, "fn hidden(request: Ping) -> Pong;");
     has(
         &rust,
-        "    pub trait Echo {\n        fn unary(Ping) -> Pong;\n",
+        "    pub trait Echo {\n        fn unary(request: Ping) -> Pong;\n",
     );
-    has(&rust, "#[client_streaming]\n        fn server(Ping) -> ();");
-    has(&rust, "#[server_streaming]\n        fn bare(()) -> ();");
-    has(&rust, "fn listed(List<foo::Entry>) -> ();");
-    has(&rust, "fn unit(()) -> ();");
+    has(
+        &rust,
+        "#[client_streaming]\n        fn server(request: Ping) -> ();",
+    );
+    has(
+        &rust,
+        "#[server_streaming]\n        fn bare(request: ()) -> ();",
+    );
+    has(&rust, "fn listed(request: List<foo::Entry>) -> ();");
+    has(&rust, "fn unit(request: ()) -> ();");
     assert_eq!(rust.matches("package = \"demo.v1\"").count(), 2, "{rust}");
     let bad = render_service_module(
         SchemaKind::Capnp,
@@ -148,7 +160,7 @@ fn protoc_compiles_proto_service() {
     let text = fs::read_to_string(&compiled.service_rust).expect("rust");
     has(
         &text,
-        "#[server_streaming]\n        fn Server(Ping) -> Pong;",
+        "#[server_streaming]\n        fn Server(request: Ping) -> Pong;",
     );
     assert!(
         compiled
@@ -181,7 +193,10 @@ fn foryc_compiles_fdl_when_present() {
         .expect("foryc");
     let text = fs::read_to_string(&compiled.service_rust).expect("rust");
     has(&text, "grpc_service");
-    has(&text, "#[bidi_streaming]\n        fn Bidi(Ping) -> Pong;");
+    has(
+        &text,
+        "#[bidi_streaming]\n        fn Bidi(request: Ping) -> Pong;",
+    );
     assert!(compiled.tool_output.iter().any(|path| path.is_file()));
     fs::remove_dir_all(dir).expect("cleanup");
 }
@@ -199,8 +214,11 @@ fn capnp_compiles_or_reports_missing_binary() {
     if present {
         let compiled = result.expect("capnp");
         let text = fs::read_to_string(&compiled.service_rust).expect("rust");
-        has(&text, "fn unary(Ping) -> Pong;");
-        has(&text, "#[bidi_streaming]\n        fn bidi(Ping) -> Pong;");
+        has(&text, "fn unary(request: Ping) -> Pong;");
+        has(
+            &text,
+            "#[bidi_streaming]\n        fn bidi(request: Ping) -> Pong;",
+        );
         assert!(compiled.tool_output.iter().all(|path| path.is_file()));
     } else {
         let message = result.expect_err("missing").to_string();
@@ -222,4 +240,18 @@ fn tool_lookup_uses_supplied_path_and_rejects_missing_compilers() {
     assert_eq!(super::resolve_tool(&tool, None), Some(tool));
     assert!(super::resolve_tool(PathBuf::from("absent-foryc").as_path(), Some(&path)).is_none());
     fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn generated_services_are_valid_rust_items() {
+    for (kind, source) in [
+        (SchemaKind::Proto, PROTO),
+        (SchemaKind::Fdl, FDL),
+        (SchemaKind::Capnp, CAPNP),
+    ] {
+        let source = render_service_module(kind, source).expect("render");
+        let parsed: syn::File = syn::parse_file(&source).expect("valid Rust service declaration");
+        let tokens: proc_macro2::TokenStream = quote::quote!(#parsed);
+        syn::parse2::<syn::File>(tokens).expect("valid roundtrip tokens");
+    }
 }
