@@ -4,7 +4,14 @@
 //! Repeated entries retain insertion order. This owned collection allocates on
 //! insertion; it makes no allocation guarantees for RPC hot paths.
 
-use std::fmt;
+use std::{fmt, time::Duration};
+
+use base64::{
+    Engine as _, alphabet,
+    engine::{
+        DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, general_purpose::STANDARD_NO_PAD,
+    },
+};
 
 /// A validated ASCII value or an unencoded binary value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +33,10 @@ pub enum MetadataError {
     ValueKindMismatch,
     /// An ASCII value contains bytes outside `0x20..=0x7e`.
     InvalidAsciiValue,
+    /// A binary header contains malformed Base64.
+    InvalidBinaryValue,
+    /// A timeout is malformed or cannot fit the eight-digit wire representation.
+    InvalidTimeout,
 }
 
 impl fmt::Display for MetadataError {
@@ -35,6 +46,8 @@ impl fmt::Display for MetadataError {
             Self::ReservedKey => "the grpc- metadata prefix is reserved for the protocol",
             Self::ValueKindMismatch => "binary metadata requires a -bin key and raw bytes",
             Self::InvalidAsciiValue => "ASCII metadata values must contain printable ASCII only",
+            Self::InvalidBinaryValue => "binary metadata must contain valid standard Base64",
+            Self::InvalidTimeout => "grpc-timeout requires up to eight digits and a supported unit",
         })
     }
 }
@@ -91,6 +104,68 @@ impl Metadata {
         Ok(())
     }
 
+    /// Encodes raw binary entries as unpadded Base64 for HTTP/2 headers or trailers.
+    #[must_use]
+    pub fn to_headers(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    match value {
+                        MetadataValue::Ascii(value) => value.clone(),
+                        MetadataValue::Binary(value) => STANDARD_NO_PAD.encode(value),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Decodes one application header, splitting comma-joined binary values.
+    ///
+    /// # Errors
+    /// Rejects reserved keys, invalid ASCII or Base64. Rejection is atomic even
+    /// when a later member of a comma-joined binary value is malformed.
+    pub fn append_header(&mut self, key: &str, value: &str) -> Result<(), MetadataError> {
+        validate_key(key)?;
+        if !key.ends_with("-bin") {
+            return self.append_ascii(key, value);
+        }
+        let engine = GeneralPurpose::new(
+            &alphabet::STANDARD,
+            GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        );
+        let decoded: Vec<Vec<u8>> = value
+            .split(',')
+            .map(|part| {
+                engine
+                    .decode(part.trim_matches([' ', '\t']))
+                    .map_err(|_| MetadataError::InvalidBinaryValue)
+            })
+            .collect::<Result<_, _>>()?;
+        self.entries.extend(
+            decoded
+                .into_iter()
+                .map(|v| (key.to_owned(), MetadataValue::Binary(v))),
+        );
+        Ok(())
+    }
+
+    /// Builds application metadata from HTTP/2 headers, preserving duplicate order.
+    ///
+    /// # Errors
+    /// Rejects any invalid application entry; protocol headers must be separated
+    /// by the transport before invoking this constructor.
+    pub fn from_headers<'a>(
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Self, MetadataError> {
+        let mut result = Self::new();
+        for (key, value) in headers {
+            result.append_header(key, value)?;
+        }
+        Ok(result)
+    }
+
     /// Iterates over entries in insertion order, including repeated keys.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &MetadataValue)> {
         self.entries
@@ -130,4 +205,124 @@ fn validate_key(key: &str) -> Result<(), MetadataError> {
         return Err(MetadataError::ReservedKey);
     }
     Ok(())
+}
+
+/// Parses a gRPC timeout with one to eight digits and a case-sensitive time unit.
+/// A zero timeout represents an already expired deadline.
+///
+/// # Errors
+/// Rejects missing/unsupported units, whitespace, signs or more than eight digits.
+pub fn parse_grpc_timeout(value: &str) -> Result<Duration, MetadataError> {
+    let bytes = value.as_bytes();
+    if !(2..=9).contains(&bytes.len()) || !bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit) {
+        return Err(MetadataError::InvalidTimeout);
+    }
+    let mut count = 0_u64;
+    for byte in &bytes[..bytes.len() - 1] {
+        count = count * 10 + u64::from(*byte - b'0');
+    }
+    Ok(match bytes[bytes.len() - 1] {
+        b'H' => Duration::from_secs(count * 3600),
+        b'M' => Duration::from_secs(count * 60),
+        b'S' => Duration::from_secs(count),
+        b'm' => Duration::from_millis(count),
+        b'u' => Duration::from_micros(count),
+        b'n' => Duration::from_nanos(count),
+        _ => return Err(MetadataError::InvalidTimeout),
+    })
+}
+
+/// Formats the finest representable timeout, rounding up to avoid an early deadline.
+///
+/// # Errors
+/// Rejects durations exceeding 99,999,999 hours rather than silently shortening them.
+pub fn format_grpc_timeout(timeout: Duration) -> Result<String, MetadataError> {
+    for (unit, nanos) in [
+        ('n', 1_u128),
+        ('u', 1_000),
+        ('m', 1_000_000),
+        ('S', 1_000_000_000),
+        ('M', 60_000_000_000),
+        ('H', 3_600_000_000_000),
+    ] {
+        let count = timeout.as_nanos().div_ceil(nanos);
+        if count <= 99_999_999 {
+            return Ok(format!("{count}{unit}"));
+        }
+    }
+    Err(MetadataError::InvalidTimeout)
+}
+
+#[cfg(test)]
+mod unit_scenario {
+    use super::*;
+
+    #[test]
+    fn binary_headers_roundtrip_and_join() -> Result<(), MetadataError> {
+        let mut metadata = Metadata::new();
+        metadata.append_binary("trace-bin", &[0, 255, 128])?;
+        metadata.append_ascii("trace", "one,two")?;
+        let wire = metadata.to_headers();
+        assert_eq!(wire[0].1, "AP+A");
+        let decoded = Metadata::from_headers(wire.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+        assert_eq!(decoded, metadata);
+        let joined = Metadata::from_headers([("data-bin", " YQ==,Yg, ")])?;
+        assert_eq!(
+            joined.get_all("data-bin").collect::<Vec<_>>(),
+            vec![
+                &MetadataValue::Binary(vec![b'a']),
+                &MetadataValue::Binary(vec![b'b']),
+                &MetadataValue::Binary(vec![])
+            ]
+        );
+        let original = metadata.clone();
+        assert_eq!(
+            metadata.append_header("data-bin", "YQ,%%%"),
+            Err(MetadataError::InvalidBinaryValue)
+        );
+        assert_eq!(metadata, original);
+        assert_eq!(
+            metadata.append_header("grpc-status", "0"),
+            Err(MetadataError::ReservedKey)
+        );
+        assert_eq!(
+            metadata.append_header("ascii", "bad\n"),
+            Err(MetadataError::InvalidAsciiValue)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_units_and_rounding() -> Result<(), MetadataError> {
+        for (wire, duration) in [
+            ("1H", Duration::from_secs(3600)),
+            ("2M", Duration::from_secs(120)),
+            ("3S", Duration::from_secs(3)),
+            ("4m", Duration::from_millis(4)),
+            ("5u", Duration::from_micros(5)),
+            ("6n", Duration::from_nanos(6)),
+            ("0n", Duration::ZERO),
+        ] {
+            assert_eq!(parse_grpc_timeout(wire)?, duration);
+            assert!(parse_grpc_timeout(&format_grpc_timeout(duration)?)? >= duration);
+        }
+        let duration = Duration::from_nanos(100_000_001);
+        assert_eq!(format_grpc_timeout(duration)?, "100001u");
+        assert!(parse_grpc_timeout(&format_grpc_timeout(duration)?)? >= duration);
+        for invalid in [
+            "",
+            "1",
+            "1s",
+            "-1S",
+            "1.5S",
+            " 1S",
+            "1S ",
+            "123456789n",
+            "éS",
+        ] {
+            assert!(parse_grpc_timeout(invalid).is_err(), "{invalid}");
+        }
+        assert!(format_grpc_timeout(Duration::MAX).is_err());
+        Ok(())
+    }
 }
