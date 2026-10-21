@@ -10,31 +10,29 @@ smol dependency, and no executor is required to encode, frame or decode a messag
 Blocking I/O and explicit nonblocking progress are the transport design;
 `!async` describes the execution model, not a Rust auto trait or a latency guarantee.
 
-## Implementation and integration boundaries
+## Runtime and interoperability boundaries
 
-The current checkout provides message envelopes, method descriptors, all three
-codec adapters, aligned framing, metadata, status handling and bounded compression.
-`SyncChannel`, `SyncServer`, `SansIoSession`, socket transports, service macros and
-schema-build integration are being integrated in their dedicated modules.
-The transport and RPC sections below describe their intended composition;
-they do not advertise callable APIs in the current scaffolding modules.
+The checkout provides `SyncChannel`, `SyncServer`, caller-thread streaming handles,
+HTTP/2 sessions, memory/TCP/Unix/TLS transports, code-first service macros and
+schema-build integration. Codec adapters, aligned framing, metadata, statuses and
+bounded compression are shared by client and server paths.
 
 The Protobuf interoperability target is **100% official gRPC wire compatibility**.
 Passing local codec and framing tests establishes those boundaries; it does not
 by itself establish end-to-end interoperability with every external gRPC stack.
-Fory and Cap'n Proto use the same envelope with explicitly negotiated payload
-formats; a Protobuf-only peer cannot decode those payloads.
+Fory and Cap'n Proto use the same envelope with codec-specific content types;
+a Protobuf-only peer cannot decode those payloads.
 
 ## Workspace architecture
 
 | Crate directory | Package | Responsibility |
 | --- | --- | --- |
-| `crates/grpc-core` | `grpc-core` | Codec contract, envelopes, framing, status, metadata, compression; session and transport integration |
+| `crates/grpc-core` | `grpc-core` | Codec contract, envelopes, framing, status, metadata, compression; HTTP/2 sessions and synchronous transports |
 | `crates/grpc-codec/prost` | `grpc-codec-prost` | Protobuf payload serialization with `ProstCodec<E, D>` |
 | `crates/grpc-codec/fory` | `grpc-codec-fory` | Reusable Apache Fory context with `ForyCodec<E, D = E>` |
 | `crates/grpc-codec/capnp` | `grpc-codec-capnp` | Typed Cap'n Proto messages and aligned borrowed readers |
-| `crates/grpc-macros` | `grpc-macros` | Code-first synchronous service generation integration |
-| `crates/grpc-build` | `grpc-build` | Schema-first compiler integration |
+| `crates/grpc-macros` | `grpc-macros` | Code-first synchronous service traits, clients and handlers |
+| `crates/grpc-build` | `grpc-build` | Schema compiler invocation and service-module generation |
 | `crates/grpc` | `grpc` | Public facade and optional codec selection |
 
 ```text
@@ -42,7 +40,7 @@ Application / generated service
             |
       SyncChannel / SyncServer          RPC integration layer
             |
-      SansIoSession + StreamSlotMap     per-stream HTTP/2 event routing
+      GrpcClientSession / GrpcServerSession     per-stream HTTP/2 state and event routing
             |
          nghttp2-rs                     synchronous HTTP/2 backend
             |
@@ -154,10 +152,10 @@ foryc --lang rust --output generated schema.fdl
 
 This command assumes `schema.fdl` exists and `foryc` is installed on `PATH`.
 Generating schema types is distinct from generating this framework's service
-stubs. `grpc-build` is the integration point for `.proto`/`prost-build`,
-`.fdl`/`foryc` and `.capnp`/`capnpc`; its compiler API is not implemented yet.
-`grpc-macros` reserves the code-first `#[grpc_service]` integration;
-that attribute is not currently exported.
+stubs. `grpc-build::SchemaCompiler` invokes `protoc`, `foryc` or `capnp` and emits
+Rust service definitions. Configure `protoc_path`, `foryc_path`, `capnp_path` and
+`include` for the installed tools and schema imports. Compiler-generated message
+types and generated service modules are separate outputs; retain both as needed.
 
 ## Cap'n Proto and alignment
 
@@ -213,9 +211,10 @@ When `grpc-status` is absent, use the canonical HTTP fallback:
 | 429, 502, 503, 504 | `Unavailable` |
 | Other values, including 200 | `Unknown` |
 
-The core implements status, metadata, timeout and framing utilities now.
-Emitting mandatory headers, routing Trailers-Only outcomes and validating external
-peers belong to the HTTP/2 session and RPC integration layer.
+`GrpcClientSession` and `GrpcServerSession` emit the required HTTP/2 headers,
+route messages and terminal outcomes by stream, and expose statuses and metadata
+to `SyncChannel` and `SyncServer`. External interoperability still depends on the
+peer's payload codec, compression support and service schema.
 
 ## Adaptive HFT compression
 
@@ -245,30 +244,147 @@ returns `Status::resource_exhausted`; malformed or truncated streams are rejecte
 Zstd additionally caps its decoding window at 16 MiB. These are message and decoder
 bounds, not a total connection-memory budget or an allocation-free guarantee.
 
-## Synchronous transport and RPC design
+## Synchronous transports and RPCs
 
-The integration design connects `SyncTransport` to `SansIoSession` over nghttp2-rs:
+`SyncChannel<T>` and `SyncServer<T>` own HTTP/2 session progress over a
+`grpc::core::transport::SyncTransport`. Construct and drive each endpoint on its
+own caller thread; the framework creates no worker thread or executor.
 
-| Transport | Intended use and behavior |
+| Transport | API and behavior |
 | --- | --- |
-| `MemoryPipe` | In-process deterministic byte exchange without network I/O |
-| `TcpTransport` | `socket2` configuration and `TCP_NODELAY` for TCP streams |
-| `UnixTransport` | Unix-domain streams for local IPC |
-| `TlsTransport` | Synchronous rustls with certificate validation and ALPN `h2` |
+| `MemoryPipe` | `pair()` creates bounded, connected in-process endpoints. |
+| `TcpTransport` | `connect` / `from_std` enable `TCP_NODELAY`; `TcpTransportListener` accepts connections. |
+| `UnixTransport` | Unix-domain streams and `UnixTransportListener` provide local IPC on Unix. |
+| `TlsTransport` | `grpc::core::tls` wraps a synchronous transport with rustls and requires negotiated ALPN `h2`. |
 
-These transport types are integration targets; they are not exported by the
-current transport scaffold. TLS configuration must supply the appropriate trust
-roots and server identity; negotiating HTTP/1.1 is not a gRPC fallback.
+`TlsClientConfig::new` takes trusted roots; `TlsServerConfig::new` takes a DER
+certificate chain and private key. These constructors use TLS 1.3. Supply the
+expected server name to `TlsTransport::client`; `TlsTransport::server` takes the
+server identity configuration. Constructors perform no I/O: call `handshake`
+or let the first nonempty read/write progress it. Configure socket deadlines for
+blocking handshakes. HTTP/1.1 negotiation is an error, not a gRPC fallback.
 
-`SyncChannel` owns client-side HTTP/2 progress; `SyncServer` dispatches services.
-The four method cardinalities are `Unary`, `ServerStreaming`, `ClientStreaming`
-and `BidiStreaming`. Blocking `call`/`recv` and explicit `step`/`try_recv` progress
-are the intended operating modes, with no runtime task spawning.
-`StreamSlotMap` must retain each stream's headers, messages and terminal status,
-so driving an order-placement Unary cannot discard a concurrent market-data stream.
-The design uses configurable 8 MiB stream/connection flow-control windows and
-returns receive credit as queued messages are consumed.
-These names describe the integration contract, not fabricated callable examples.
+`SyncChannel::new` uses `ChannelConfig::default()`. `with_config` controls authority,
+scheme, RPC timeout, default compression and session limits. Use scheme `https`
+with TLS. Outgoing channel compression defaults to `Identity`; select Zstd through
+`ChannelConfig::with_compression` or per-call options. `CallOptions` supplies
+per-call metadata, timeout and compression. Unary returns the decoded response,
+initial metadata and trailing metadata. Stream handles preserve status errors and
+provide blocking operations plus explicit `try_*` progress returning `WouldBlock`.
+
+| RPC shape | Client entry point | Server registration |
+| --- | --- | --- |
+| Unary | `channel.unary` | `register_unary` |
+| Server streaming | `channel.server_streaming`, then `recv_next` / `finish` | `register_server_streaming` with a `ResponseSink` |
+| Client streaming | `channel.client_streaming`, then `send` / `finish` | `register_client_streaming` with a `RequestStream` |
+| Bidirectional streaming | `channel.bidi_streaming`, then interleaved `send` / `recv_next` and `half_close` | `register_bidi_streaming` with request stream and response sink |
+
+`serve_connection` dispatches a registered server connection on its caller thread.
+`shutdown_with_goaway` starts graceful draining. The advertised initial stream receive
+window defaults to 1 MiB; message and per-stream byte limits default to 16 MiB. These limits are
+configurable through `SessionConfig`. Consume queued messages to return receive
+credit; connection progress retains other streams' pending messages and statuses.
+
+A complete unary exchange over a memory pipe uses a thread for each endpoint:
+
+```rust
+use std::thread;
+use grpc::{CallOptions, ProstCodec, Response, SyncChannel, SyncServer};
+use grpc::core::transport::MemoryPipe;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (client_transport, server_transport) = MemoryPipe::pair();
+    let worker = thread::spawn(move || -> Result<(), grpc::Status> {
+        let mut server = SyncServer::new(server_transport)?;
+        server.register_unary(
+            "/hft.OrderService/PlaceOrder",
+            ProstCodec::<String, String>::new(),
+            |request| Ok(Response::new(format!("accepted: {}", request.get_ref()))),
+        )?;
+        server.serve_connection()
+    });
+    let result = (|| {
+        let mut channel = SyncChannel::new(client_transport)?;
+        channel.unary(
+            "/hft.OrderService/PlaceOrder",
+            &"buy 42".to_owned(),
+            &mut ProstCodec::<String, String>::new(),
+            CallOptions::default(),
+        )
+    })();
+    let served = worker.join().map_err(|_| "server worker panicked")?;
+    let (message, _initial, _trailers) = result?;
+    assert_eq!(message, "accepted: buy 42");
+    served?;
+    Ok(())
+}
+```
+
+## Generated service clients and handlers
+
+`#[grpc::macros::grpc_service]` exports a handler trait, a client wrapper, a server
+wrapper, a service-specific channel adapter trait and method descriptors:
+
+```rust
+#[grpc::macros::grpc_service(package = "hft")]
+pub trait OrderService {
+    fn place_order(request: String) -> String;
+    #[server_streaming]
+    fn subscribe_depth(request: String) -> String;
+    #[client_streaming]
+    fn upload_fills(request: String) -> String;
+    #[bidi_streaming]
+    fn order_stream(request: String) -> String;
+}
+
+fn main() {
+    assert_eq!(ORDER_SERVICE_PLACE_ORDER.path, "/hft.OrderService/PlaceOrder");
+}
+```
+
+The expansion uses `grpc_core` paths; applications using the attribute must also
+include `grpc-core` as a direct dependency from the same checkout or Git revision.
+Implement the expanded `OrderService` handler trait with `Request` / `Response`
+envelopes. Generated streaming methods batch their request or response messages
+in `Vec`; the direct channel/server streaming interfaces above support incremental
+send/receive instead.
+
+Construct `OrderServiceClient::new(adapter, codec)` and
+`OrderServiceServer::new(handler, codec)`. The adapter implements the generated
+`OrderServiceChannel<C>` trait and forwards each method descriptor, request metadata
+and compression selection to `SyncChannel`. Register generated server methods with
+the matching `SyncServer::register_*` routes. The macro does not automatically
+register network routes or implement a service-specific channel adapter.
+
+Both wrappers provide `.with_codec::<NewCodec>()` and
+`.with_compression(CompressionAlgorithm::Zstd)`. Codec replacement constructs
+`NewCodec::default()`; configure a registered Fory context before passing it to
+`new` when its type registry is required. Client and server must agree on their
+message schemas and selected codec. Protobuf, Fory and Cap'n Proto all pass through
+the same framing, compression and HTTP/2 layers.
+
+## Examples, E2E tests and benchmarks
+
+Run the order-service example, the client/server parity test target, and the
+standalone benchmark from the workspace root:
+
+```sh
+cargo run -p grpc --all-features --example hft_order_service
+cargo test -p grpc --all-features --test hft_e2e_parity
+cargo bench -p grpc --all-features --bench hft_rpc_bench
+```
+
+The example uses loopback TCP and generated service adapters. The E2E target covers
+RPC results across method shapes, codecs, compression and transports. Local
+client/server E2E tests exercise this implementation on both endpoints; they do
+not establish interoperability with an independent gRPC implementation.
+
+Benchmarks report codec/framing, compression and complete RPC exchange costs.
+RPC samples reuse established connections and exclude connection setup/teardown.
+`GRPC_BENCH_ITERATIONS` selects 1–1,000,000 samples per workload (default 32);
+results include p50/p99 latency in nanoseconds and throughput in operations/second.
+Interpret results with the workload, payload size, transport and build profile; the framework's synchronous design does not imply
+an allocation-free path or a fixed latency bound.
 
 ## Verification and maintenance
 
@@ -276,8 +392,9 @@ Run the repository gates from the workspace root:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo test -p grpc --no-default-features --features fory
 bash .github/scripts/ci-incremental.sh
 ```
 
