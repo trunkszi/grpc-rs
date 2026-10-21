@@ -3,6 +3,8 @@
 //! Memory pipes are bounded and allocate their buffers at construction. Socket
 //! transports use OS buffering; callers retain control over scheduling and threads.
 
+#[cfg(unix)]
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream};
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
@@ -59,16 +61,20 @@ struct MemoryLane {
 }
 
 impl MemoryLane {
-    fn new(capacity: usize) -> Self {
-        Self {
+    fn new(capacity: usize) -> io::Result<Self> {
+        let mut bytes = VecDeque::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
+        Ok(Self {
             buffer: Mutex::new(MemoryBuffer {
-                bytes: VecDeque::with_capacity(capacity),
+                bytes,
                 capacity,
                 reader_alive: true,
                 writer_alive: true,
             }),
             changed: Condvar::new(),
-        }
+        })
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, MemoryBuffer>> {
@@ -112,14 +118,17 @@ pub struct MemoryPipe {
 
 impl MemoryPipe {
     /// Creates a pair with 64 KiB of preallocated capacity in each direction.
+    ///
+    /// # Panics
+    /// Panics if the default buffers cannot be allocated.
     pub fn pair() -> (Self, Self) {
-        Self::pair_with_capacity(64 * 1024)
+        Self::with_capacity(64 * 1024).expect("cannot allocate default memory pipe")
     }
 
     /// Creates a pair with the given byte capacity in each direction.
     ///
     /// # Errors
-    /// Returns `InvalidInput` if capacity is zero or exceeds the maximum allocation size.
+    /// Returns an error for invalid capacity or buffer allocation failure.
     pub fn with_capacity(capacity: usize) -> io::Result<(Self, Self)> {
         if capacity == 0 || capacity > isize::MAX as usize {
             return Err(io::Error::new(
@@ -127,27 +136,19 @@ impl MemoryPipe {
                 "memory transport capacity must be positive and fit an allocation",
             ));
         }
-        Ok(Self::pair_with_capacity(capacity))
-    }
-
-    fn pair_with_capacity(capacity: usize) -> (Self, Self) {
-        let incoming = Arc::new(MemoryLane::new(capacity));
-        let outgoing = Arc::new(MemoryLane::new(capacity));
-        let first = Self {
-            incoming: Arc::clone(&incoming),
-            outgoing: Arc::clone(&outgoing),
+        let incoming = Arc::new(MemoryLane::new(capacity)?);
+        let outgoing = Arc::new(MemoryLane::new(capacity)?);
+        let endpoint = |incoming, outgoing| Self {
+            incoming,
+            outgoing,
             nonblocking: false,
             read_timeout: None,
             write_timeout: None,
         };
-        let second = Self {
-            incoming: outgoing,
-            outgoing: incoming,
-            nonblocking: false,
-            read_timeout: None,
-            write_timeout: None,
-        };
-        (first, second)
+        Ok((
+            endpoint(Arc::clone(&incoming), Arc::clone(&outgoing)),
+            endpoint(outgoing, incoming),
+        ))
     }
 
     fn validate_timeout(timeout: Option<Duration>) -> io::Result<()> {
@@ -251,19 +252,18 @@ impl SyncTransport for MemoryPipe {
 impl Drop for MemoryPipe {
     fn drop(&mut self) {
         // Recover poisoned guards so a failed peer still wakes blocked operations.
-        let mut incoming = match self.incoming.buffer.lock() {
-            Ok(buffer) => buffer,
-            Err(error) => error.into_inner(),
-        };
-        incoming.reader_alive = false;
-        self.incoming.changed.notify_all();
-        drop(incoming);
-        let mut outgoing = match self.outgoing.buffer.lock() {
-            Ok(buffer) => buffer,
-            Err(error) => error.into_inner(),
-        };
-        outgoing.writer_alive = false;
-        self.outgoing.changed.notify_all();
+        for (lane, reader) in [(&self.incoming, true), (&self.outgoing, false)] {
+            let mut buffer = match lane.buffer.lock() {
+                Ok(buffer) => buffer,
+                Err(error) => error.into_inner(),
+            };
+            if reader {
+                buffer.reader_alive = false;
+            } else {
+                buffer.writer_alive = false;
+            }
+            lane.changed.notify_all();
+        }
     }
 }
 
@@ -331,6 +331,17 @@ impl TcpTransport {
         stream: TcpStream,
         options: TcpTransportOptions,
     ) -> io::Result<Self> {
+        for size in [options.send_buffer_size, options.recv_buffer_size]
+            .into_iter()
+            .flatten()
+        {
+            if size == 0 || size > i32::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "socket buffer size must fit a positive c_int",
+                ));
+            }
+        }
         stream.set_nodelay(true)?;
         let socket = socket2::SockRef::from(&stream);
         socket.set_keepalive(options.keepalive.is_some())?;
@@ -351,6 +362,10 @@ impl TcpTransport {
         }
         stream.set_nonblocking(options.nonblocking)?;
         Ok(Self(stream))
+    }
+
+    fn endpoint(&self) -> io::Result<String> {
+        Ok(self.0.peer_addr()?.to_string())
     }
 
     /// Returns the connected peer address.
@@ -420,12 +435,6 @@ macro_rules! impl_stream_transport {
     };
 }
 
-impl TcpTransport {
-    fn endpoint(&self) -> io::Result<String> {
-        Ok(self.0.peer_addr()?.to_string())
-    }
-}
-
 impl_stream_transport!(TcpTransport, TcpStream);
 
 /// A TCP listener whose accepted streams enable `TCP_NODELAY`.
@@ -459,42 +468,12 @@ impl TcpTransportListener {
         }
         Err(last_error)
     }
-
-    /// Wraps an existing listener.
-    pub fn from_std(listener: TcpListener) -> Self {
-        Self(listener)
-    }
-
-    /// Accepts a stream and configures `TCP_NODELAY`.
-    ///
-    /// # Errors
-    /// Returns an error if accepting or configuring the stream fails.
-    pub fn accept(&self) -> io::Result<(TcpTransport, SocketAddr)> {
-        let (stream, address) = self.0.accept()?;
-        Ok((TcpTransport::from_std(stream)?, address))
-    }
-
-    /// Returns the bound address, including the assigned ephemeral port.
-    ///
-    /// # Errors
-    /// Returns an error if the address cannot be queried.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
-    }
-
-    /// Configures whether accepting returns immediately.
-    ///
-    /// # Errors
-    /// Returns an error if the operating system rejects the setting.
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
-    }
 }
 
 /// A Unix domain byte stream.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UnixTransport(std::os::unix::net::UnixStream);
+pub struct UnixTransport(UnixStream);
 
 #[cfg(unix)]
 impl UnixTransport {
@@ -503,14 +482,14 @@ impl UnixTransport {
     /// # Errors
     /// Returns an error if the connection fails.
     pub fn connect(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        Self::from_std(std::os::unix::net::UnixStream::connect(path)?)
+        Self::from_std(UnixStream::connect(path)?)
     }
 
     /// Wraps an existing Unix domain stream.
     ///
     /// # Errors
     /// This operation currently always succeeds.
-    pub fn from_std(stream: std::os::unix::net::UnixStream) -> io::Result<Self> {
+    pub fn from_std(stream: UnixStream) -> io::Result<Self> {
         Ok(Self(stream))
     }
 
@@ -524,12 +503,12 @@ impl UnixTransport {
 }
 
 #[cfg(unix)]
-impl_stream_transport!(UnixTransport, std::os::unix::net::UnixStream);
+impl_stream_transport!(UnixTransport, UnixStream);
 
 /// A Unix domain listener. The caller owns cleanup of its socket path.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UnixTransportListener(std::os::unix::net::UnixListener);
+pub struct UnixTransportListener(UnixListener);
 
 #[cfg(unix)]
 impl UnixTransportListener {
@@ -538,48 +517,68 @@ impl UnixTransportListener {
     /// # Errors
     /// Returns an error if the path cannot be bound.
     pub fn bind(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        Ok(Self(std::os::unix::net::UnixListener::bind(path)?))
-    }
-
-    /// Wraps an existing Unix domain listener.
-    pub fn from_std(listener: std::os::unix::net::UnixListener) -> Self {
-        Self(listener)
-    }
-
-    /// Accepts a connected Unix domain stream.
-    ///
-    /// # Errors
-    /// Returns an error if accepting fails.
-    pub fn accept(&self) -> io::Result<(UnixTransport, std::os::unix::net::SocketAddr)> {
-        let (stream, address) = self.0.accept()?;
-        Ok((UnixTransport::from_std(stream)?, address))
-    }
-
-    /// Returns the bound Unix domain socket address.
-    ///
-    /// # Errors
-    /// Returns an error if the address cannot be queried.
-    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
-        self.0.local_addr()
-    }
-
-    /// Configures whether accepting returns immediately.
-    ///
-    /// # Errors
-    /// Returns an error if the operating system rejects the setting.
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
+        Ok(Self(UnixListener::bind(path)?))
     }
 }
 
+macro_rules! impl_listener {
+    ($wrapper:ident, $listener:ty, $transport:ident, $address:ty) => {
+        impl $wrapper {
+            /// Wraps an existing listener.
+            pub fn from_std(listener: $listener) -> Self {
+                Self(listener)
+            }
+
+            /// Accepts and configures a connected transport.
+            ///
+            /// # Errors
+            /// Returns an error if accepting or configuring the stream fails.
+            pub fn accept(&self) -> io::Result<($transport, $address)> {
+                let (stream, address) = self.0.accept()?;
+                Ok(($transport::from_std(stream)?, address))
+            }
+
+            /// Returns the bound socket address.
+            ///
+            /// # Errors
+            /// Returns an error if the address cannot be queried.
+            pub fn local_addr(&self) -> io::Result<$address> {
+                self.0.local_addr()
+            }
+
+            /// Configures whether accepting returns immediately.
+            ///
+            /// # Errors
+            /// Returns an error if the operating system rejects the setting.
+            pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+                self.0.set_nonblocking(nonblocking)
+            }
+        }
+    };
+}
+impl_listener!(TcpTransportListener, TcpListener, TcpTransport, SocketAddr);
+#[cfg(unix)]
+impl_listener!(
+    UnixTransportListener,
+    UnixListener,
+    UnixTransport,
+    UnixSocketAddr
+);
+
 #[cfg(test)]
 mod tests {
-    use io::ErrorKind::{BrokenPipe, TimedOut, WouldBlock};
+    use io::ErrorKind::{BrokenPipe, InvalidInput, TimedOut, WouldBlock};
 
     use super::*;
 
     fn error_kind<T>(result: io::Result<T>) -> Option<io::ErrorKind> {
         result.err().map(|error| error.kind())
+    }
+
+    fn joined<T>(thread: std::thread::JoinHandle<io::Result<T>>) -> io::Result<T> {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("worker panicked"))?
     }
 
     #[test]
@@ -622,6 +621,7 @@ mod tests {
         assert_eq!(second.read(&mut bytes)?, 0);
         assert!(MemoryPipe::with_capacity(0).is_err());
         assert!(MemoryPipe::with_capacity(usize::MAX).is_err());
+        assert!(MemoryPipe::with_capacity(isize::MAX as usize).is_err());
         Ok(())
     }
 
@@ -655,12 +655,7 @@ mod tests {
         });
         second.write_all(b"wake")?;
         drop(second);
-        assert_eq!(
-            reader
-                .join()
-                .map_err(|_| io::Error::other("reader panicked"))??,
-            b"wake"
-        );
+        assert_eq!(joined(reader)?, b"wake");
         Ok(())
     }
 
@@ -673,9 +668,7 @@ mod tests {
         let writer = std::thread::spawn(move || -> io::Result<()> { first.write_all(b"bc") });
         let mut bytes = [0; 3];
         second.read_exact(&mut bytes)?;
-        writer
-            .join()
-            .map_err(|_| io::Error::other("writer panicked"))??;
+        joined(writer)?;
         assert_eq!(&bytes, b"abc");
         Ok(())
     }
@@ -687,9 +680,7 @@ mod tests {
         first.write_all(b"a")?;
         let writer = std::thread::spawn(move || first.write(b"b"));
         drop(second);
-        let result = writer
-            .join()
-            .map_err(|_| io::Error::other("writer panicked"))?;
+        let result = joined(writer);
         assert_eq!(error_kind(result), Some(BrokenPipe));
         Ok(())
     }
@@ -786,6 +777,22 @@ mod tests {
             listener.accept().expect_err("empty accept queue").kind(),
             WouldBlock
         );
+        Ok(())
+    }
+    #[test]
+    fn tcp_rejects_unrepresentable_and_zero_buffer_sizes() -> io::Result<()> {
+        let listener = TcpTransportListener::bind("127.0.0.1:0")?;
+        for size in [0, i32::MAX as usize + 1, usize::MAX] {
+            for send in [false, true] {
+                let options = TcpTransportOptions {
+                    send_buffer_size: send.then_some(size),
+                    recv_buffer_size: (!send).then_some(size),
+                    ..TcpTransportOptions::default()
+                };
+                let result = TcpTransport::connect_with_options(listener.local_addr()?, options);
+                assert_eq!(error_kind(result), Some(InvalidInput));
+            }
+        }
         Ok(())
     }
 }
