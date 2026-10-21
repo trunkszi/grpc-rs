@@ -235,6 +235,8 @@ where
 {
     let listener = TcpTransportListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
+    let transport = TcpTransport::connect(address)?;
+    assert!(transport.get_ref().nodelay()?);
     let server = thread::spawn(move || -> Result<(), Status> {
         let (transport, _) = listener
             .accept()
@@ -250,8 +252,6 @@ where
         server.serve_connection()
     });
     let outcome = (|| -> ExampleResult {
-        let transport = TcpTransport::connect(address)?;
-        assert!(transport.get_ref().nodelay()?);
         let channel = SyncChannel::with_config(
             transport,
             ChannelConfig {
