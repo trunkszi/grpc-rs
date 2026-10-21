@@ -14,6 +14,7 @@ pub mod response;
 pub mod session;
 pub mod slot_map;
 pub mod status;
+pub mod tls;
 pub mod transport;
 
 pub use codec::Codec;
