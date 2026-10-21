@@ -177,6 +177,24 @@ mod unit {
     }
 
     #[test]
+    fn scenario_unknown_wire_types_do_not_hide_later_known_fields() {
+        let mut codec = ProstCodec::<String, String>::new();
+        let payload = b"\x0a\x03old\x11abcdefgh\x1dijkl\x22\x03xyz\x28\x96\x01\x0a\x03new";
+        assert_eq!(codec.decode(payload).unwrap(), "new");
+
+        for truncated_unknown in [
+            &b"\x11abcdefg"[..],
+            &b"\x1dabc"[..],
+            &b"\x22\x04xyz"[..],
+            &b"\x28\x80"[..],
+        ] {
+            let mut payload = b"\x0a\x02ok".to_vec();
+            payload.extend_from_slice(truncated_unknown);
+            assert!(codec.decode(&payload).is_err());
+        }
+    }
+
+    #[test]
     fn scenario_decode_rejects_malformed_payloads_and_trailing_bytes() {
         let mut codec = ProstCodec::<String, String>::new();
         for payload in [
