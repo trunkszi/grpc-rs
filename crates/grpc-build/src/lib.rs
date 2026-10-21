@@ -154,7 +154,7 @@ pub fn render_service_module(kind: SchemaKind, source: &str) -> Result<String, B
     if services.is_empty() {
         return Err(BuildError::new("schema does not define a service"));
     }
-    Ok(render(&services))
+    render(&services)
 }
 fn fail(context: &impl std::fmt::Display, error: io::Error) -> BuildError {
     BuildError::new(format!("{context}: {error}"))
@@ -197,61 +197,40 @@ fn list_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
     let mut files = Vec::new();
     let entries = fs::read_dir(dir).map_err(|error| fail(&dir.display(), error))?;
     for entry in entries {
-        files.push(entry.map_err(|error| BuildError::new(format!("read dir: {error}")))?.path());
+        let path = entry.map_err(|error| BuildError::new(format!("read dir: {error}")))?.path();
+        if path.is_file() { files.push(path); }
     }
     files.sort();
     Ok(files)
 }
 fn run_command(program: &Path, args: &[String], stdout_path: Option<&Path>) -> Result<(), BuildError> {
     let output = Command::new(program).args(args).output().map_err(|error| BuildError::new(format!("failed to spawn {}: {error}", program.display())))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(BuildError::new(format!("{} exited {}: {stderr}{stdout}", program.display(), output.status)));
+    }
     if let Some(path) = stdout_path {
         fs::write(path, &output.stdout).map_err(|error| fail(&path.display(), error))?;
     }
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(BuildError::new(format!("{} exited {}: {stderr}{stdout}", program.display(), output.status)))
+    Ok(())
 }
-enum Tok {
-    Ident(String),
-    Symbol(char),
-    Str(String),
-}
-struct ServiceDef {
-    package: String,
-    name: String,
-    methods: Vec<MethodDef>,
-}
-struct MethodDef {
-    name: String,
-    request: String,
-    response: String,
-    client_streaming: bool,
-    server_streaming: bool,
-}
+enum Tok { Ident(String), Symbol(char), Str(String) }
+struct ServiceDef { package: String, name: String, methods: Vec<MethodDef> }
+struct MethodDef { name: String, request: String, response: String, client_streaming: bool, server_streaming: bool }
 fn lex(source: &str) -> Result<Vec<Tok>, BuildError> {
     let chars: Vec<char> = source.chars().collect();
     let mut index = 0;
     let mut tokens = Vec::new();
     while index < chars.len() {
         let ch = chars[index];
-        if ch.is_whitespace() {
-            index += 1;
+        if ch.is_whitespace() { index += 1; continue; }
+        if ch == '#' || (ch == '/' && chars.get(index + 1) == Some(&'/')) {
+            while index < chars.len() && chars[index] != '\n' { index += 1; }
             continue;
         }
-        if ch == '/' && chars.get(index + 1) == Some(&'/') {
-            while index < chars.len() && chars[index] != '\n' {
-                index += 1;
-            }
-            continue;
-        }
-        if ch == '/' && chars.get(index + 1) == Some(&'*') {
-            index = skip_block(&chars, index)?;
-            continue;
-        }
-        if ch == '"' {
+        if ch == '/' && chars.get(index + 1) == Some(&'*') { index = skip_block(&chars, index)?; continue; }
+        if ch == '"' || ch == '\'' {
             let (next, text) = read_string(&chars, index)?;
             tokens.push(Tok::Str(text));
             index = next;
@@ -260,9 +239,7 @@ fn lex(source: &str) -> Result<Vec<Tok>, BuildError> {
         if ch.is_ascii_alphabetic() || ch == '_' || ch.is_ascii_digit() {
             let start = index;
             index += 1;
-            while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') {
-                index += 1;
-            }
+            while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') { index += 1; }
             tokens.push(Tok::Ident(chars[start..index].iter().collect()));
             continue;
         }
@@ -273,32 +250,22 @@ fn lex(source: &str) -> Result<Vec<Tok>, BuildError> {
 }
 fn skip_block(chars: &[char], start: usize) -> Result<usize, BuildError> {
     let mut index = start + 2;
-    while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
-        index += 1;
-    }
+    while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') { index += 1; }
     if index + 1 >= chars.len() { Err(BuildError::new("unterminated block comment")) } else { Ok(index + 2) }
 }
 fn read_string(chars: &[char], start: usize) -> Result<(usize, String), BuildError> {
+    let quote = chars[start];
     let mut index = start + 1;
     let mut text = String::new();
     while index < chars.len() {
         let ch = chars[index];
         if ch == '\\' {
-            let Some(escaped) = chars.get(index + 1).copied() else {
-                break;
-            };
-            text.push(match escaped {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                other => other,
-            });
+            let Some(escaped) = chars.get(index + 1).copied() else { break; };
+            text.push(match escaped { 'n' => '\n', 't' => '\t', 'r' => '\r', other => other });
             index += 2;
             continue;
         }
-        if ch == '"' {
-            return Ok((index + 1, text));
-        }
+        if ch == quote { return Ok((index + 1, text)); }
         text.push(ch);
         index += 1;
     }
@@ -308,39 +275,42 @@ fn parse_rpc_schema(tokens: &[Tok]) -> Result<Vec<ServiceDef>, BuildError> {
     let mut services = Vec::new();
     let mut package = String::new();
     let mut index = 0;
+    let mut depth = 0i32;
     while index < tokens.len() {
-        if ident_is(tokens, index, "package") {
+        if depth == 0 && ident_is(tokens, index, "package") {
             let (next, name) = parse_package_name(tokens, index)?;
             package = name;
             index = next;
             continue;
         }
-        if ident_is(tokens, index, "service") {
+        if depth == 0 && ident_is(tokens, index, "service") {
             let (next, service) = parse_service(tokens, index, &package)?;
             services.push(service);
             index = next;
             continue;
         }
+        if symbol_is(tokens, index, '{') { depth += 1; }
+        else if symbol_is(tokens, index, '}') {
+            depth -= 1;
+            if depth < 0 { return Err(BuildError::new("unbalanced '}'")); }
+        }
         index += 1;
     }
+    if depth != 0 { return Err(BuildError::new("unclosed '{'")); }
     Ok(services)
 }
 fn parse_package_name(tokens: &[Tok], mut index: usize) -> Result<(usize, String), BuildError> {
     index += 1;
     let (next, name) = read_dotted(tokens, index)?;
     index = next;
-    if symbol_is(tokens, index, ';') {
-        index += 1;
-    }
+    if symbol_is(tokens, index, ';') { index += 1; }
     if name.is_empty() { Err(BuildError::new("package name is empty")) } else { Ok((index, name)) }
 }
 fn parse_service(tokens: &[Tok], mut index: usize, package: &str) -> Result<(usize, ServiceDef), BuildError> {
     index += 1;
     let name = expect_ident(tokens, index, "service")?;
     index += 1;
-    if !symbol_is(tokens, index, '{') {
-        return Err(BuildError::new(format!("service {name} is missing a body")));
-    }
+    if !symbol_is(tokens, index, '{') { return Err(BuildError::new(format!("service {name} is missing a body"))); }
     index += 1;
     let mut methods = Vec::new();
     let mut depth = 1i32;
@@ -351,16 +321,11 @@ fn parse_service(tokens: &[Tok], mut index: usize, package: &str) -> Result<(usi
             index = next;
             continue;
         }
-        if symbol_is(tokens, index, '{') {
-            depth += 1;
-        } else if symbol_is(tokens, index, '}') {
-            depth -= 1;
-        }
+        if symbol_is(tokens, index, '{') { depth += 1; }
+        else if symbol_is(tokens, index, '}') { depth -= 1; }
         index += 1;
     }
-    if depth != 0 {
-        return Err(BuildError::new(format!("service {name} is unclosed")));
-    }
+    if depth != 0 { return Err(BuildError::new(format!("service {name} is unclosed"))); }
     Ok((index, ServiceDef { package: package.to_string(), name, methods }))
 }
 fn parse_rpc(tokens: &[Tok], mut index: usize) -> Result<(usize, MethodDef), BuildError> {
@@ -369,188 +334,199 @@ fn parse_rpc(tokens: &[Tok], mut index: usize) -> Result<(usize, MethodDef), Bui
     index += 1;
     let (next, client_streaming, request) = parse_paren_message(tokens, index)?;
     index = next;
-    if !ident_is(tokens, index, "returns") {
-        return Err(BuildError::new(format!("rpc {name} is missing returns")));
-    }
+    if !ident_is(tokens, index, "returns") { return Err(BuildError::new(format!("rpc {name} is missing returns"))); }
     index += 1;
     let (next, server_streaming, response) = parse_paren_message(tokens, index)?;
     index = next;
-    if symbol_is(tokens, index, ';') {
-        index += 1;
-    }
+    if symbol_is(tokens, index, ';') { index += 1; }
     Ok((index, MethodDef { name, request, response, client_streaming, server_streaming }))
 }
-fn parse_paren_message(tokens: &[Tok], mut index: usize) -> Result<(usize, bool, String), BuildError> {
-    if !symbol_is(tokens, index, '(') {
-        return Err(BuildError::new("expected '(' before a message type"));
-    }
-    index += 1;
-    let mut streaming = false;
-    if ident_is(tokens, index, "stream") {
-        streaming = true;
-        index += 1;
-    }
-    let (next, ty) = read_dotted(tokens, index)?;
-    index = next;
-    if !symbol_is(tokens, index, ')') {
-        return Err(BuildError::new("expected ')' after a message type"));
-    }
-    Ok((index + 1, streaming, ty))
+fn parse_paren_message(tokens: &[Tok], index: usize) -> Result<(usize, bool, String), BuildError> {
+    if !symbol_is(tokens, index, '(') { return Err(BuildError::new("expected '(' before a message type")); }
+    let (next, streaming, ty) = parse_type_position(tokens, index + 1)?;
+    if !symbol_is(tokens, next, ')') { return Err(BuildError::new("expected ')' after a message type")); }
+    Ok((next + 1, streaming, ty))
 }
 fn parse_capnp(tokens: &[Tok]) -> Result<Vec<ServiceDef>, BuildError> {
     let mut services = Vec::new();
     let mut package = String::new();
-    let mut index = 0;
+    scan_types(tokens, 0, false, &mut package, &mut services)?;
+    Ok(services)
+}
+fn scan_types(tokens: &[Tok], mut index: usize, stop: bool, package: &mut String, services: &mut Vec<ServiceDef>) -> Result<usize, BuildError> {
+    let mut depth = 0i32;
     while index < tokens.len() {
-        if let Some((next, found)) = parent_module(tokens, index) {
-            package = found;
-            index = next;
+        if stop && depth == 0 && symbol_is(tokens, index, '}') { return Ok(index + 1); }
+        if depth == 0 && symbol_is(tokens, index, '$') { index = take_dollar(tokens, index, package, services)?; continue; }
+        if depth == 0 && is_stmt_keyword(tokens, index) { index = skip_semicolon(tokens, index)?; continue; }
+        if depth == 0 && is_type_word(tokens, index) {
+            index = open_type(tokens, index, package, services)?;
             continue;
         }
-        if ident_is(tokens, index, "interface") {
-            let (next, service) = parse_interface(tokens, index, &package)?;
-            services.push(service);
-            index = next;
-            continue;
-        }
-        if ident_is(tokens, index, "struct") || ident_is(tokens, index, "enum") {
-            index = skip_braced(tokens, index)?;
-            continue;
+        if symbol_is(tokens, index, '{') { depth += 1; }
+        else if symbol_is(tokens, index, '}') {
+            depth -= 1;
+            if depth < 0 { return Err(BuildError::new("unbalanced '}'")); }
         }
         index += 1;
     }
-    Ok(services)
+    if stop || depth != 0 { Err(BuildError::new("unclosed '{'")) } else { Ok(index) }
 }
-fn parent_module(tokens: &[Tok], index: usize) -> Option<(usize, String)> {
-    if !symbol_is(tokens, index, '$') || ident_text(tokens, index + 1) != Some("Rust") || !symbol_is(tokens, index + 2, '.') || ident_text(tokens, index + 3) != Some("parentModule") || !symbol_is(tokens, index + 4, '(') {
-        return None;
+fn open_type(tokens: &[Tok], index: usize, package: &mut String, services: &mut Vec<ServiceDef>) -> Result<usize, BuildError> {
+    if ident_is(tokens, index, "interface") {
+        let (next, service) = parse_interface(tokens, index, package, services)?;
+        services.push(service);
+        Ok(next)
+    } else {
+        skip_named_type(tokens, index, package, services)
     }
-    let Tok::Str(package) = tokens.get(index + 5)? else {
-        return None;
-    };
-    if !symbol_is(tokens, index + 6, ')') || !valid_package(package) {
-        return None;
+}
+fn take_dollar(tokens: &[Tok], index: usize, package: &mut String, services: &mut [ServiceDef]) -> Result<usize, BuildError> {
+    if let Some((next, found)) = parent_module(tokens, index)? {
+        *package = found;
+        for service in services { service.package.clone_from(package); }
+        return Ok(next);
     }
+    skip_annotation(tokens, index)
+}
+fn parent_module(tokens: &[Tok], index: usize) -> Result<Option<(usize, String)>, BuildError> {
+    let shaped = symbol_is(tokens, index, '$') && ident_is(tokens, index + 1, "Rust") && symbol_is(tokens, index + 2, '.') && ident_is(tokens, index + 3, "parentModule") && symbol_is(tokens, index + 4, '(');
+    if !shaped { return Ok(None); }
+    let Some(Tok::Str(package)) = tokens.get(index + 5) else { return Err(BuildError::new("invalid $Rust.parentModule package")); };
+    if !symbol_is(tokens, index + 6, ')') || !valid_package(package) { return Err(BuildError::new("invalid $Rust.parentModule package")); }
     let mut next = index + 7;
-    if symbol_is(tokens, next, ';') {
-        next += 1;
-    }
-    Some((next, package.clone()))
+    if symbol_is(tokens, next, ';') { next += 1; }
+    Ok(Some((next, package.clone())))
 }
-fn parse_interface(tokens: &[Tok], mut index: usize, package: &str) -> Result<(usize, ServiceDef), BuildError> {
+fn parse_interface(tokens: &[Tok], mut index: usize, package: &mut String, services: &mut Vec<ServiceDef>) -> Result<(usize, ServiceDef), BuildError> {
     index += 1;
     let name = expect_ident(tokens, index, "interface")?;
     index += 1;
-    while index < tokens.len() && !symbol_is(tokens, index, '{') {
-        index += 1;
-    }
-    if !symbol_is(tokens, index, '{') {
-        return Err(BuildError::new(format!("interface {name} is missing a body")));
-    }
+    while index < tokens.len() && !symbol_is(tokens, index, '{') && !symbol_is(tokens, index, ';') { index += 1; }
+    if !symbol_is(tokens, index, '{') { return Err(BuildError::new(format!("interface {name} is missing a body"))); }
     index += 1;
-    let mut depth = 1i32;
     let mut methods = Vec::new();
-    while index < tokens.len() && depth > 0 {
-        if depth == 1 && is_stmt_keyword(tokens, index) {
-            index = skip_semicolon(tokens, index)?;
-            continue;
+    let mut depth = 0i32;
+    while index < tokens.len() {
+        if depth == 0 && symbol_is(tokens, index, '}') {
+            return Ok((index + 1, ServiceDef { package: package.clone(), name, methods }));
         }
-        if depth == 1 && is_nested_keyword(tokens, index) {
-            index = skip_braced(tokens, index)?;
-            continue;
-        }
-        if depth == 1 && ident_text(tokens, index).is_some() {
+        if depth == 0 && symbol_is(tokens, index, '$') { index = take_dollar(tokens, index, package, services)?; continue; }
+        if depth == 0 && is_stmt_keyword(tokens, index) { index = skip_semicolon(tokens, index)?; continue; }
+        if depth == 0 && is_type_word(tokens, index) { index = open_type(tokens, index, package, services)?; continue; }
+        if depth == 0 && ident_text(tokens, index).is_some() {
             let (next, method) = parse_capnp_method(tokens, index)?;
             methods.push(method);
             index = next;
             continue;
         }
-        if symbol_is(tokens, index, '{') {
-            depth += 1;
-        } else if symbol_is(tokens, index, '}') {
+        if symbol_is(tokens, index, '{') { depth += 1; }
+        else if symbol_is(tokens, index, '}') {
             depth -= 1;
+            if depth < 0 { return Err(BuildError::new("unbalanced '}'")); }
         }
         index += 1;
     }
-    if depth != 0 {
-        return Err(BuildError::new(format!("interface {name} is unclosed")));
-    }
-    Ok((index, ServiceDef { package: package.to_string(), name, methods }))
+    Err(BuildError::new(format!("interface {name} is unclosed")))
+}
+fn skip_named_type(tokens: &[Tok], mut index: usize, package: &mut String, services: &mut Vec<ServiceDef>) -> Result<usize, BuildError> {
+    index += 1;
+    while index < tokens.len() && !symbol_is(tokens, index, '{') && !symbol_is(tokens, index, ';') { index += 1; }
+    if symbol_is(tokens, index, ';') { Ok(index + 1) }
+    else if symbol_is(tokens, index, '{') { scan_types(tokens, index + 1, true, package, services) }
+    else { Err(BuildError::new("unclosed '{'")) }
 }
 fn parse_capnp_method(tokens: &[Tok], mut index: usize) -> Result<(usize, MethodDef), BuildError> {
     let name = expect_ident(tokens, index, "capnp method")?;
-    index += 1;
-    if symbol_is(tokens, index, '@') {
-        index += 1;
-        if ident_text(tokens, index).is_some() {
-            index += 1;
-        }
-    }
-    let (next, client_streaming, request) = parse_capnp_side(tokens, index)?;
-    index = next;
-    if !symbol_is(tokens, index, '-') || !symbol_is(tokens, index + 1, '>') {
-        return Err(BuildError::new(format!("capnp method {name} is missing ->")));
-    }
-    index += 2;
-    let (next, server_streaming, response) = parse_capnp_side(tokens, index)?;
-    index = next;
-    if symbol_is(tokens, index, ';') {
-        index += 1;
-    }
+    index = skip_annotations(tokens, skip_ordinal(tokens, index + 1))?;
+    let (client_streaming, request, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
+        (false, "()".to_string(), index)
+    } else {
+        let (next, streaming, ty) = parse_capnp_side(tokens, index)?;
+        (streaming, ty, next)
+    };
+    index = skip_annotations(tokens, next)?;
+    let (server_streaming, response, next) = if symbol_is(tokens, index, '-') && symbol_is(tokens, index + 1, '>') {
+        let (next, streaming, ty) = parse_capnp_side(tokens, index + 2)?;
+        (streaming, ty, next)
+    } else {
+        (false, "()".to_string(), index)
+    };
+    index = skip_annotations(tokens, next)?;
+    if symbol_is(tokens, index, ';') { index += 1; }
     Ok((index, MethodDef { name, request, response, client_streaming, server_streaming }))
 }
 fn parse_capnp_side(tokens: &[Tok], index: usize) -> Result<(usize, bool, String), BuildError> {
-    if symbol_is(tokens, index, '(') { parse_capnp_params(tokens, index) } else { parse_capnp_type(tokens, index) }
-}
-fn parse_capnp_type(tokens: &[Tok], mut index: usize) -> Result<(usize, bool, String), BuildError> {
-    let mut streaming = false;
-    if ident_is(tokens, index, "stream") {
-        streaming = true;
-        index += 1;
-    }
-    let (next, ty) = read_dotted(tokens, index)?;
-    Ok((next, streaming, ty))
+    if symbol_is(tokens, index, '(') { parse_capnp_params(tokens, index) } else { parse_type_position(tokens, index) }
 }
 fn parse_capnp_params(tokens: &[Tok], mut index: usize) -> Result<(usize, bool, String), BuildError> {
     index += 1;
+    if symbol_is(tokens, index, ')') { return Ok((index + 1, false, "()".to_string())); }
     let mut streaming = false;
     let mut types = Vec::new();
     while index < tokens.len() && !symbol_is(tokens, index, ')') {
-        if symbol_is(tokens, index, ',') {
-            index += 1;
-            continue;
+        if symbol_is(tokens, index, ',') { index += 1; continue; }
+        index = skip_ordinal(tokens, index);
+        if ident_text(tokens, index).is_some() && (symbol_is(tokens, index + 1, ':') || symbol_is(tokens, index + 1, '@')) {
+            index = skip_ordinal(tokens, index + 1);
         }
-        if ident_text(tokens, index).is_some() && symbol_is(tokens, index + 1, ':') {
-            if ident_is(tokens, index, "stream") {
-                streaming = true;
-            }
-            index += 2;
-        }
-        if ident_is(tokens, index, "stream") {
-            streaming = true;
-            index += 1;
-        }
-        let (next, ty) = read_dotted(tokens, index)?;
+        if symbol_is(tokens, index, ':') { index += 1; }
+        let (next, stream, ty) = parse_type_position(tokens, index)?;
+        streaming |= stream;
         types.push(ty);
         index = next;
+        if symbol_is(tokens, index, '=') { index = skip_default(tokens, index)?; }
     }
-    if !symbol_is(tokens, index, ')') || types.is_empty() {
-        return Err(BuildError::new("capnp method is missing a parameter type"));
-    }
+    if !symbol_is(tokens, index, ')') { return Err(BuildError::new("capnp parameter list is unclosed")); }
     let ty = if types.len() == 1 { types.remove(0) } else { format!("({})", types.join(", ")) };
     Ok((index + 1, streaming, ty))
 }
+fn parse_type_position(tokens: &[Tok], index: usize) -> Result<(usize, bool, String), BuildError> {
+    if ident_is(tokens, index, "stream") && !closes_type(tokens, index + 1) {
+        if bare_stream(tokens, index + 1) { return Ok((index + 1, true, "()".to_string())); }
+        let (next, ty) = read_type(tokens, index + 1)?;
+        return Ok((next, true, ty));
+    }
+    let (next, ty) = read_type(tokens, index)?;
+    Ok((next, false, ty))
+}
+fn closes_type(tokens: &[Tok], index: usize) -> bool {
+    symbol_is(tokens, index, ')') || symbol_is(tokens, index, ',') || symbol_is(tokens, index, '=')
+}
+fn bare_stream(tokens: &[Tok], index: usize) -> bool {
+    index >= tokens.len() || symbol_is(tokens, index, ';') || symbol_is(tokens, index, '$') || symbol_is(tokens, index, '-')
+}
+fn read_type(tokens: &[Tok], index: usize) -> Result<(usize, String), BuildError> {
+    let (mut index, mut name) = read_dotted(tokens, index)?;
+    while symbol_is(tokens, index, '(') {
+        let (next, args) = type_args(tokens, index)?;
+        name.push('<');
+        name.push_str(&args);
+        name.push('>');
+        index = next;
+    }
+    Ok((index, name))
+}
+fn type_args(tokens: &[Tok], mut index: usize) -> Result<(usize, String), BuildError> {
+    index += 1;
+    let mut args = Vec::new();
+    while index < tokens.len() && !symbol_is(tokens, index, ')') {
+        if symbol_is(tokens, index, ',') { index += 1; continue; }
+        let (next, ty) = read_type(tokens, index)?;
+        args.push(ty);
+        index = next;
+    }
+    if !symbol_is(tokens, index, ')') { return Err(BuildError::new("unclosed type arguments")); }
+    Ok((index + 1, args.join(", ")))
+}
 fn read_dotted(tokens: &[Tok], mut index: usize) -> Result<(usize, String), BuildError> {
-    let Some(first) = ident_text(tokens, index) else {
-        return Err(BuildError::new("expected a type name"));
-    };
+    if symbol_is(tokens, index, '.') { index += 1; }
+    let Some(first) = ident_text(tokens, index) else { return Err(BuildError::new("expected a type name")); };
     ensure_ident(first)?;
     let mut name = first.to_string();
     index += 1;
     while symbol_is(tokens, index, '.') {
-        let Some(part) = ident_text(tokens, index + 1) else {
-            break;
-        };
+        let Some(part) = ident_text(tokens, index + 1) else { break; };
         ensure_ident(part)?;
         name.push('.');
         name.push_str(part);
@@ -558,25 +534,27 @@ fn read_dotted(tokens: &[Tok], mut index: usize) -> Result<(usize, String), Buil
     }
     Ok((index, name))
 }
-fn render(services: &[ServiceDef]) -> String {
+fn render(services: &[ServiceDef]) -> Result<String, BuildError> {
     let mut out = String::from("// Schema services lowered into synchronous grpc-service traits.\n");
     let mut used = Vec::new();
     for service in services {
         let mut module = reshape(&service.name, false);
-        if used.iter().any(|name: &String| name == &module) {
-            module = format!("{module}_{}", used.len());
-        }
+        if is_keyword(&module) { module.push('_'); }
+        if used.iter().any(|name: &String| name == &module) { module = format!("{module}_{}", used.len()); }
         used.push(module.clone());
         out.push_str("#[allow(non_snake_case)]\n");
         out.push_str(&format!("pub mod {module} {{\n"));
-        if service.package.is_empty() {
-            out.push_str("    #[::grpc_macros::grpc_service]\n");
-        } else {
+        if service.package.is_empty() { out.push_str("    #[::grpc_macros::grpc_service]\n"); }
+        else {
             let package = &service.package;
             out.push_str(&format!("    #[::grpc_macros::grpc_service(package = \"{package}\")]\n"));
         }
         out.push_str(&format!("    pub trait {} {{\n", service.name));
-        for method in &service.methods {
+        for (slot, method) in service.methods.iter().enumerate() {
+            if service.methods[..slot].iter().any(|prev| prev.name == method.name) {
+                let duplicate = &method.name;
+                return Err(BuildError::new(format!("duplicate method {duplicate}")));
+            }
             out.push_str(cardinality_attr(method));
             let request = method.request.replace('.', "::");
             let response = method.response.replace('.', "::");
@@ -584,7 +562,7 @@ fn render(services: &[ServiceDef]) -> String {
         }
         out.push_str("    }\n}\n");
     }
-    out
+    Ok(out)
 }
 fn cardinality_attr(method: &MethodDef) -> &'static str {
     match (method.client_streaming, method.server_streaming) {
@@ -595,18 +573,12 @@ fn cardinality_attr(method: &MethodDef) -> &'static str {
     }
 }
 fn expect_ident(tokens: &[Tok], index: usize, role: &str) -> Result<String, BuildError> {
-    let Some(name) = ident_text(tokens, index) else {
-        return Err(BuildError::new(format!("{role} is missing a name")));
-    };
+    let Some(name) = ident_text(tokens, index) else { return Err(BuildError::new(format!("{role} is missing a name"))); };
     ensure_ident(name)?;
     Ok(name.to_string())
 }
 fn ensure_ident(name: &str) -> Result<(), BuildError> {
-    if is_rust_ident(name) && !is_keyword(name) {
-        Ok(())
-    } else {
-        Err(BuildError::new(format!("invalid schema identifier `{name}`")))
-    }
+    if is_rust_ident(name) && !is_keyword(name) { Ok(()) } else { Err(BuildError::new(format!("invalid schema identifier `{name}`"))) }
 }
 fn valid_package(package: &str) -> bool {
     !package.is_empty() && package.split('.').all(|part| is_rust_ident(part) && !is_keyword(part))
@@ -629,60 +601,66 @@ fn is_keyword(name: &str) -> bool {
 fn reshape(name: &str, ascii_upper: bool) -> String {
     let mut out = String::new();
     for (index, ch) in name.chars().enumerate() {
-        if ch.is_ascii_uppercase() && index > 0 {
-            out.push('_');
-        }
-        if ascii_upper {
-            out.push(ch.to_ascii_uppercase());
-        } else {
-            out.push(ch.to_ascii_lowercase());
-        }
+        if ch.is_ascii_uppercase() && index > 0 { out.push('_'); }
+        if ascii_upper { out.push(ch.to_ascii_uppercase()); } else { out.push(ch.to_ascii_lowercase()); }
     }
     out
 }
 fn ident_text(tokens: &[Tok], index: usize) -> Option<&str> {
-    match tokens.get(index) {
-        Some(Tok::Ident(text)) => Some(text.as_str()),
-        _ => None,
-    }
+    match tokens.get(index) { Some(Tok::Ident(text)) => Some(text.as_str()), _ => None }
 }
-fn ident_is(tokens: &[Tok], index: usize, expected: &str) -> bool {
-    ident_text(tokens, index) == Some(expected)
-}
+fn ident_is(tokens: &[Tok], index: usize, expected: &str) -> bool { ident_text(tokens, index) == Some(expected) }
 fn symbol_is(tokens: &[Tok], index: usize, symbol: char) -> bool {
     matches!(tokens.get(index), Some(Tok::Symbol(found)) if *found == symbol)
 }
 fn is_stmt_keyword(tokens: &[Tok], index: usize) -> bool {
     matches!(ident_text(tokens, index), Some("using" | "import" | "const" | "annotation"))
 }
-fn is_nested_keyword(tokens: &[Tok], index: usize) -> bool {
+fn is_type_word(tokens: &[Tok], index: usize) -> bool {
     matches!(ident_text(tokens, index), Some("struct" | "enum" | "interface" | "union" | "group"))
 }
-fn skip_semicolon(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
-    while index < tokens.len() && !symbol_is(tokens, index, ';') {
+fn skip_ordinal(tokens: &[Tok], mut index: usize) -> usize {
+    if symbol_is(tokens, index, '@') {
         index += 1;
+        if ident_text(tokens, index).is_some() { index += 1; }
     }
-    if symbol_is(tokens, index, ';') { Ok(index + 1) } else { Err(BuildError::new("expected ';'")) }
+    index
 }
-fn skip_braced(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
-    while index < tokens.len() && !symbol_is(tokens, index, '{') && !symbol_is(tokens, index, ';') {
+fn skip_annotations(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
+    while symbol_is(tokens, index, '$') { index = skip_annotation(tokens, index)?; }
+    Ok(index)
+}
+fn skip_annotation(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
+    index += 1;
+    if ident_text(tokens, index).is_some() {
         index += 1;
+        while symbol_is(tokens, index, '.') && ident_text(tokens, index + 1).is_some() { index += 2; }
     }
-    if symbol_is(tokens, index, ';') { Ok(index + 1) } else { skip_balanced(tokens, index, '{', '}') }
+    if symbol_is(tokens, index, '(') { index = skip_balanced(tokens, index, '(', ')')?; }
+    Ok(index)
 }
-fn skip_balanced(tokens: &[Tok], mut index: usize, open: char, close: char) -> Result<usize, BuildError> {
-    if !symbol_is(tokens, index, open) {
-        return Err(BuildError::new("expected a delimiter"));
-    }
+fn skip_default(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
     let mut depth = 0i32;
     while index < tokens.len() {
-        if symbol_is(tokens, index, open) {
-            depth += 1;
-        } else if symbol_is(tokens, index, close) {
+        if depth == 0 && (symbol_is(tokens, index, ',') || symbol_is(tokens, index, ')')) { return Ok(index); }
+        if symbol_is(tokens, index, '(') { depth += 1; }
+        else if symbol_is(tokens, index, ')') { depth -= 1; }
+        index += 1;
+    }
+    Err(BuildError::new("capnp default is unclosed"))
+}
+fn skip_semicolon(tokens: &[Tok], mut index: usize) -> Result<usize, BuildError> {
+    while index < tokens.len() && !symbol_is(tokens, index, ';') { index += 1; }
+    if symbol_is(tokens, index, ';') { Ok(index + 1) } else { Err(BuildError::new("expected ';'")) }
+}
+fn skip_balanced(tokens: &[Tok], mut index: usize, open: char, close: char) -> Result<usize, BuildError> {
+    if !symbol_is(tokens, index, open) { return Err(BuildError::new("expected a delimiter")); }
+    let mut depth = 0i32;
+    while index < tokens.len() {
+        if symbol_is(tokens, index, open) { depth += 1; }
+        else if symbol_is(tokens, index, close) {
             depth -= 1;
-            if depth == 0 {
-                return Ok(index + 1);
-            }
+            if depth == 0 { return Ok(index + 1); }
         }
         index += 1;
     }
@@ -702,28 +680,57 @@ mod tests {
         fs::create_dir_all(&dir).expect("temp dir");
         dir
     }
-    fn has(text: &str, needle: &str) {
-        assert!(text.contains(needle), "missing {needle} in {text}");
-    }
+    fn has(text: &str, needle: &str) { assert!(text.contains(needle), "missing {needle} in {text}"); }
     #[test]
     fn lowers_proto_fdl_capnp_and_dotted_types() {
         for (kind, source) in [(SchemaKind::Proto, PROTO), (SchemaKind::Fdl, FDL)] {
             let rust = render_service_module(kind, source).expect("render");
             has(&rust, "package = \"demo.v1\"");
-            has(&rust, "#[server_streaming]");
-            has(&rust, "#[client_streaming]");
-            has(&rust, "#[bidi_streaming]");
+            has(&rust, "#[server_streaming]\n        fn Server(Ping) -> Pong;");
+            has(&rust, "#[client_streaming]\n        fn Client(Ping) -> Pong;");
+            has(&rust, "#[bidi_streaming]\n        fn Bidi(Ping) -> Pong;");
             has(&rust, "fn Unary(Ping) -> Pong;");
         }
         let dotted = "package demo.v1; service Echo { rpc Unary (foo.bar.Ping) returns (foo.bar.Pong); }";
-        let rust = render_service_module(SchemaKind::Proto, dotted).expect("dotted");
-        has(&rust, "fn Unary(foo::bar::Ping) -> foo::bar::Pong;");
+        has(&render_service_module(SchemaKind::Proto, dotted).expect("dotted"), "fn Unary(foo::bar::Ping) -> foo::bar::Pong;");
         let capnp = render_service_module(SchemaKind::Capnp, CAPNP).expect("capnp");
         has(&capnp, "#[server_streaming]\n        fn server(Ping) -> Pong;");
         has(&capnp, "#[client_streaming]\n        fn client(Ping) -> Pong;");
         has(&capnp, "#[bidi_streaming]\n        fn bidi(Ping) -> Pong;");
         has(&capnp, "fn unary(Ping) -> Pong;");
         has(&capnp, "package = \"demo.v1\"");
+    }
+    #[test]
+    fn covers_schema_edges() {
+        let buried = "message Job { string service = 1; string package = 2; } service Echo { rpc Unary (Ping) returns (Pong); }";
+        let rust = render_service_module(SchemaKind::Proto, buried).expect("buried");
+        assert_eq!(rust.matches("pub trait").count(), 1, "{rust}");
+        has(&rust, "fn Unary(Ping) -> Pong;");
+        let lead = "service Echo { rpc Unary (.demo.v1.Ping) returns (stream .demo.v1.Pong); }";
+        has(&render_service_module(SchemaKind::Proto, lead).expect("lead"), "#[server_streaming]\n        fn Unary(demo::v1::Ping) -> demo::v1::Pong;");
+        let named = render_service_module(SchemaKind::Proto, "service Echo { rpc Unary (stream) returns (Pong); }").expect("stream type");
+        has(&named, "fn Unary(stream) -> Pong;");
+        assert!(!named.contains("streaming"), "{named}");
+        has(&render_service_module(SchemaKind::Proto, "service Type { rpc Unary (Ping) returns (Pong); }").expect("keyword"), "pub mod type_ {");
+        let open = render_service_module(SchemaKind::Proto, "message Ping {").expect_err("brace");
+        assert!(open.to_string().contains("unclosed"), "{open}");
+        let dup = render_service_module(SchemaKind::Proto, "service Echo { rpc A (Ping) returns (Pong); rpc A (Ping) returns (Pong); }").expect_err("dup");
+        assert!(dup.to_string().contains("duplicate"), "{dup}");
+        has(&render_service_module(SchemaKind::Fdl, "import 'api/service.fdl'; service Echo { rpc Unary (Ping) returns (Pong); }").expect("quotes"), "fn Unary(Ping) -> Pong;");
+        let cap = "# interface Old { foo @0 (x :Ping) -> (y :Pong); }\nstruct Box { interface Inner { hidden @0 (q :Ping) -> (r :Pong); } }\ninterface Echo {\n# }\nunary @0 (stream :Ping) -> (response :Pong);\nserver @1 (request @0 :stream Ping);\nbare @2 -> stream;\nlisted @3 (items :List(foo.Entry)) -> ();\nunit @4 ();\n}\n$Rust.parentModule(\"demo.v1\");\n";
+        let rust = render_service_module(SchemaKind::Capnp, cap).expect("capnp edges");
+        assert!(!rust.contains("fn foo("), "{rust}");
+        has(&rust, "fn hidden(Ping) -> Pong;");
+        has(&rust, "    pub trait Echo {\n        fn unary(Ping) -> Pong;\n");
+        has(&rust, "#[client_streaming]\n        fn server(Ping) -> ();");
+        has(&rust, "#[server_streaming]\n        fn bare(()) -> ();");
+        has(&rust, "fn listed(List<foo::Entry>) -> ();");
+        has(&rust, "fn unit(()) -> ();");
+        assert_eq!(rust.matches("package = \"demo.v1\"").count(), 2, "{rust}");
+        let bad = render_service_module(SchemaKind::Capnp, "$Rust.parentModule(\"demo::v1\"); interface E { u @0 (r :Ping) -> (s :Pong); }").expect_err("pkg");
+        assert!(bad.to_string().contains("parentModule"), "{bad}");
+        let other = render_service_module(SchemaKind::Capnp, "$Rust.other(\"nope\"); interface Echo { unary @0 (r :Ping) -> (s :Pong); }").expect("other");
+        assert!(!other.contains("package ="), "{other}");
     }
     #[test]
     fn rejects_incomplete_input() {
@@ -734,7 +741,7 @@ mod tests {
         fs::write(&schema, "service Echo {}").expect("write");
         let error = SchemaCompiler::new(dir.join("out")).compile(&schema).expect_err("ext");
         assert!(error.to_string().contains("unsupported"));
-        fs::remove_dir_all(&dir).expect("cleanup");
+        fs::remove_dir_all(dir).expect("cleanup");
     }
     #[test]
     fn protoc_compiles_proto_service() {
@@ -743,46 +750,41 @@ mod tests {
         fs::write(&schema, PROTO).expect("write");
         let compiled = SchemaCompiler::new(dir.join("out")).compile(&schema).expect("protoc");
         let text = fs::read_to_string(&compiled.service_rust).expect("rust");
-        has(&text, "#[bidi_streaming]");
-        assert!(compiled.tool_output.iter().any(|path| path.extension().is_some_and(|ext| ext == "pb")));
-        fs::remove_dir_all(&dir).expect("cleanup");
+        has(&text, "#[server_streaming]\n        fn Server(Ping) -> Pong;");
+        assert!(compiled.tool_output.iter().any(|path| path.extension().is_some_and(|ext| ext == "pb") && path.is_file()));
+        fs::remove_dir_all(dir).expect("cleanup");
     }
     #[test]
     fn foryc_compiles_fdl_when_present() {
         let foryc = PathBuf::from("/root/.local/bin/foryc");
-        if !foryc.is_file() {
-            return;
-        }
+        if !foryc.is_file() { return; }
         let dir = scratch("fdl");
         let schema = dir.join("echo.fdl");
         fs::write(&schema, FDL).expect("write");
-        let compiled = SchemaCompiler::new(dir.join("out")).foryc_path(&foryc).compile(&schema).expect("foryc");
+        let compiled = SchemaCompiler::new(dir.join("out")).foryc_path(foryc).compile(&schema).expect("foryc");
         let text = fs::read_to_string(&compiled.service_rust).expect("rust");
         has(&text, "grpc_service");
-        has(&text, "#[bidi_streaming]");
-        assert!(!compiled.tool_output.is_empty());
-        fs::remove_dir_all(&dir).expect("cleanup");
+        has(&text, "#[bidi_streaming]\n        fn Bidi(Ping) -> Pong;");
+        assert!(compiled.tool_output.iter().any(|path| path.is_file()));
+        fs::remove_dir_all(dir).expect("cleanup");
     }
     #[test]
     fn capnp_compiles_or_reports_missing_binary() {
+        let present = PathBuf::from("/usr/bin/capnp").is_file() || process::Command::new("capnp").arg("--version").output().is_ok();
         let dir = scratch("capnp");
         let schema = dir.join("echo.capnp");
-        let source = concat!(
-            "@0x9a2b3c4d5e6f7081; struct Ping { text @0 :Text; } ",
-            "interface Echo { unary @0 (request :Ping) -> (response :Ping); }"
-        );
-        fs::write(&schema, source).expect("write");
-        match SchemaCompiler::new(dir.join("out")).compile(&schema) {
-            Ok(compiled) => {
-                let text = fs::read_to_string(&compiled.service_rust).expect("rust");
-                has(&text, "fn unary(Ping) -> Ping;");
-                assert!(!compiled.tool_output.is_empty());
-            }
-            Err(error) => {
-                let message = error.to_string();
-                assert!(message.contains("failed to spawn") || message.contains("capnp"), "{message}");
-            }
+        fs::write(&schema, CAPNP).expect("write");
+        let result = SchemaCompiler::new(dir.join("out")).compile(&schema);
+        if present {
+            let compiled = result.expect("capnp");
+            let text = fs::read_to_string(&compiled.service_rust).expect("rust");
+            has(&text, "fn unary(Ping) -> Pong;");
+            has(&text, "#[bidi_streaming]\n        fn bidi(Ping) -> Pong;");
+            assert!(compiled.tool_output.iter().all(|path| path.is_file()));
+        } else {
+            let message = result.expect_err("missing").to_string();
+            assert!(message.contains("failed to spawn"), "{message}");
         }
-        fs::remove_dir_all(&dir).expect("cleanup");
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 }
