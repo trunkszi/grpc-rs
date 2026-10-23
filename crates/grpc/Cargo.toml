@@ -1,0 +1,49 @@
+[package]
+name = "grpc-rs"
+version = "0.0.2"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+readme = "../../README.md"
+description = "Runtime-free gRPC client and server framework for Rust over nexora-proto HTTP/2 and Linux io_uring"
+
+[lib]
+name = "grpc"
+
+[lints]
+workspace = true
+
+[features]
+default = ["protobuf"]
+protobuf = ["dep:grpc-codec-prost", "dep:prost", "grpc-build/protobuf"]
+fory = ["dep:grpc-codec-fory", "dep:fory"]
+capnp = ["dep:grpc-codec-capnp", "dep:capnp", "grpc-build/capnp"]
+
+[dependencies]
+thiserror = { workspace = true }
+prost = { workspace = true, optional = true, features = ["derive"] }
+fory = { workspace = true, optional = true }
+capnp = { workspace = true, optional = true }
+grpc-core = { workspace = true }
+grpc-macros = { workspace = true }
+grpc-codec-prost = { workspace = true, optional = true }
+grpc-codec-fory = { workspace = true, optional = true }
+grpc-codec-capnp = { workspace = true, optional = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+grpc-build = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+
+[[example]]
+name = "order_service"
+required-features = ["protobuf", "fory", "capnp"]
+
+[[bench]]
+name = "rpc_bench"
+harness = false
+required-features = ["protobuf", "fory", "capnp"]

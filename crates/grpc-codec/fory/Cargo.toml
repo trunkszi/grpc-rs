@@ -1,0 +1,15 @@
+[package]
+name = "grpc-codec-fory"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+readme = "../../../README.md"
+description = "Apache Fory codec for grpc-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+grpc-core = { workspace = true }
+fory = { workspace = true }
