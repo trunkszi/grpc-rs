@@ -158,6 +158,21 @@ impl LengthPrefixedFrame {
         }
         let mut messages = Vec::new();
         while !chunk.is_empty() {
+            if self.message.is_none() && self.header_len == 0 && chunk.len() >= FRAME_HEADER_SIZE {
+                let length = match self.header_length(chunk) {
+                    Ok(length) => length,
+                    Err(error) => return Err(self.fail(error)),
+                };
+                if length <= chunk.len() - FRAME_HEADER_SIZE {
+                    let end = FRAME_HEADER_SIZE + length;
+                    let message =
+                        AlignedMessageBuf::new(&chunk[FRAME_HEADER_SIZE..end], chunk[0] == 1)
+                            .map_err(|error| self.fail(error))?;
+                    messages.push(message);
+                    chunk = &chunk[end..];
+                    continue;
+                }
+            }
             if self.message.is_none() {
                 let count = (FRAME_HEADER_SIZE - self.header_len).min(chunk.len());
                 self.header[self.header_len..self.header_len + count]
@@ -195,16 +210,11 @@ impl LengthPrefixedFrame {
         Ok(messages)
     }
 
-    fn start_message(&mut self) -> Result<(), Status> {
-        if self.header[0] > 1 {
+    fn header_length(&self, header: &[u8]) -> Result<usize, Status> {
+        if header[0] > 1 {
             return Err(Status::internal("invalid gRPC compressed flag"));
         }
-        let length = u32::from_be_bytes([
-            self.header[1],
-            self.header[2],
-            self.header[3],
-            self.header[4],
-        ]);
+        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         let length = usize::try_from(length)
             .map_err(|_| Status::resource_exhausted("gRPC message length exceeds platform size"))?;
         if length > self.max_message_size {
@@ -212,6 +222,11 @@ impl LengthPrefixedFrame {
                 "gRPC message exceeds maximum decoding size",
             ));
         }
+        Ok(length)
+    }
+
+    fn start_message(&mut self) -> Result<(), Status> {
+        let length = self.header_length(&self.header)?;
         self.message = Some(AlignedMessageBuf::with_payload_len(
             length,
             self.header[0] == 1,
