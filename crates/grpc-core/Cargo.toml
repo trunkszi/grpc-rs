@@ -21,9 +21,14 @@ socket2 = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 anyhow = { workspace = true }
 rcgen = { workspace = true }
 
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "core_hotpath_bench"
+harness = false

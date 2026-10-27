@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+use receive::*;
+
 use crate::{
     compression::{CompressionAlgorithm, CompressionConfig},
     framing::{AlignedMessageBuf, LengthPrefixedFrame},
@@ -51,15 +53,20 @@ pub struct SessionConfig {
     pub content_type: String,
     pub scheme: String,
 }
-#[rustfmt::skip]
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_streams: 100, initial_window_size: 1024 * 1024,
-            max_frame_size: 16_384, max_header_list_size: 64 * 1024,
-            max_inbound_message_size: 16 * 1024 * 1024, per_stream_byte_budget: 16 * 1024 * 1024,
-            max_active_streams: 1024, compression: CompressionConfig::default(),
-            user_agent: "grpc-rs/0.1.0".into(), scheme: "http".into(), content_type: "application/grpc".into(),
+            max_concurrent_streams: 100,
+            initial_window_size: 1024 * 1024,
+            max_frame_size: 16_384,
+            max_header_list_size: 64 * 1024,
+            max_inbound_message_size: 16 * 1024 * 1024,
+            per_stream_byte_budget: 16 * 1024 * 1024,
+            max_active_streams: 1024,
+            compression: CompressionConfig::default(),
+            user_agent: "grpc-rs/0.1.0".into(),
+            scheme: "http".into(),
+            content_type: "application/grpc".into(),
         }
     }
 }
@@ -87,7 +94,6 @@ struct Source {
     queue: Rc<RefCell<Outbound>>,
     chunk: Vec<u8>,
 }
-#[rustfmt::skip]
 impl DataSource for Source {
     fn read(&mut self, max_len: usize) -> DataPoll<'_> {
         let mut queue = self.queue.borrow_mut();
@@ -99,77 +105,49 @@ impl DataSource for Source {
         }
         if queue.eof {
             queue.finished = true;
-            if queue.trailers { DataPoll::EofWithTrailers } else { DataPoll::Eof }
+            if queue.trailers {
+                DataPoll::EofWithTrailers
+            } else {
+                DataPoll::Eof
+            }
         } else {
             queue.deferred = true;
             DataPoll::Deferred
         }
     }
 }
-#[rustfmt::skip]
 struct Stream {
     decoder: LengthPrefixedFrame,
     encoding: CompressionAlgorithm,
     outgoing_encoding: CompressionAlgorithm,
     outgoing: Rc<RefCell<Outbound>>,
-    headers: Headers, header_bytes: usize,
-    initial: bool, sent_initial: bool, terminal: bool, closed: bool, end_stream_serialized: bool, dispatched: bool,
-    failure: Option<Status>, failure_taken: bool, http_status: u16,
+    headers: Headers,
+    header_bytes: usize,
+    state: StreamHsm,
+    failure: Option<Status>,
+    failure_taken: bool,
+    http_status: u16,
     pending_trailers: Option<Vec<(String, String)>>,
-    prefix: Vec<u8>, remaining: usize, reserved: usize,
+    prefix: [u8; 5],
+    prefix_len: usize,
+    remaining: usize,
+    reserved: usize,
 }
 /// Single-threaded session. Closed slots remain readable until explicitly removed.
-#[rustfmt::skip]
 pub struct GrpcSession<Role> {
-    protocol: Http2Session, config: SessionConfig, slots: StreamSlotMap,
+    protocol: Http2Session,
+    config: SessionConfig,
+    slots: StreamSlotMap,
     streams: BTreeMap<i32, Stream>,
     incoming: VecDeque<IncomingRequest>,
-    wire: Vec<u8>, transport_pending: Vec<u8>, transport_offset: usize, transport_flushed: bool,
-    failed: Option<Status>, draining: bool, role: PhantomData<Role>,
+    wire: Vec<u8>,
+    transport_pending: Vec<u8>,
+    transport_offset: usize,
+    transport_flushed: bool,
+    failure: Option<SessionFailure>,
+    phase: SessionPhase,
+    role: PhantomData<Role>,
 }
-#[rustfmt::skip]
-fn internal(error: impl std::fmt::Display) -> Status { Status::internal(error.to_string()) }
-#[rustfmt::skip]
-fn resource() -> Status { Status::resource_exhausted("per-stream byte budget exceeded") }
-#[rustfmt::skip]
-fn slot_error(error: SlotMapError) -> Status {
-    match error { SlotMapError::MemoryLimit { .. } | SlotMapError::MessageLimit { .. } => Status::resource_exhausted(error.to_string()), _ => internal(error) }
-}
-#[rustfmt::skip]
-fn fields(headers: &[(String, String)]) -> Vec<HeaderField<'_>> {
-    headers.iter().map(|(k, v)| HeaderField::new(k.as_bytes(), v.as_bytes())).collect()
-}
-#[rustfmt::skip]
-fn metadata(headers: &Headers) -> Result<Metadata, Status> {
-    let mut result = Metadata::new();
-    for (key, value) in headers {
-        if key.starts_with(':') || matches!(key.as_str(), "content-type" | "te" | "user-agent") || key.starts_with("grpc-") {
-            continue;
-        }
-        result.append_header(key, std::str::from_utf8(value).map_err(internal)?).map_err(internal)?;
-    }
-    Ok(result)
-}
-#[rustfmt::skip]
-fn validate_content_type(value: &str) -> Result<(), Status> {
-    let media = value.split(';').next().unwrap_or("");
-    let suffix = media.strip_prefix("application/grpc+");
-    if !value.bytes().all(|b| (32..127).contains(&b)) || !(media == "application/grpc" || suffix.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)))) { return Err(Status::invalid_argument("invalid gRPC content-type")); }
-    Ok(())
-}
-#[rustfmt::skip]
-fn validate_metadata(metadata: &Metadata) -> Result<(), Status> {
-    if metadata.iter().any(|(key, _)| matches!(key, "content-type" | "te" | "user-agent")) { return Err(Status::invalid_argument("application metadata contains protocol header")); }
-    Ok(())
-}
-#[rustfmt::skip]
-fn value<'a>(headers: &'a Headers, key: &str) -> Result<Option<&'a str>, Status> {
-    let mut values = headers.iter().filter(|(k, _)| k == key);
-    let result = values.next().map(|(_, v)| std::str::from_utf8(v).map_err(internal)).transpose()?;
-    if values.next().is_some() { return Err(Status::internal(format!("duplicate {key}"))); }
-    Ok(result)
-}
-#[rustfmt::skip]
 macro_rules! constructor {
     ($role:ty, $variant:ident, $endpoint:expr) => {
         impl GrpcSession<$role> {
@@ -182,22 +160,43 @@ macro_rules! constructor {
                     || !(16_384..=16_777_215).contains(&config.max_frame_size)
                     || !matches!(config.scheme.as_str(), "http" | "https")
                 {
-                    return Err(Status::invalid_argument("invalid HTTP/2 session configuration"));
+                    return Err(Status::invalid_argument(
+                        "invalid HTTP/2 session configuration",
+                    ));
                 }
                 validate_content_type(&config.content_type)?;
-                let protocol = Http2Session::new(Http2Role::$variant, Http2Settings {
-                    max_concurrent_streams: config.max_concurrent_streams,
-                    initial_window_size: config.initial_window_size,
-                    max_frame_size: config.max_frame_size,
-                    max_header_list_size: config.max_header_list_size,
-                    enable_push: false, ..Http2Settings::default()
-                }).map_err(internal)?;
-                let slots = StreamSlotMap::with_role(StreamLimits { max_buffered_bytes: config.per_stream_byte_budget, max_queued_messages: 1024 }, $endpoint);
+                let protocol = Http2Session::new(
+                    Http2Role::$variant,
+                    Http2Settings {
+                        max_concurrent_streams: config.max_concurrent_streams,
+                        initial_window_size: config.initial_window_size,
+                        max_frame_size: config.max_frame_size,
+                        max_header_list_size: config.max_header_list_size,
+                        enable_push: false,
+                        ..Http2Settings::default()
+                    },
+                )
+                .map_err(internal)?;
+                let slots = StreamSlotMap::with_role(
+                    StreamLimits {
+                        max_buffered_bytes: config.per_stream_byte_budget,
+                        max_queued_messages: 1024,
+                    },
+                    $endpoint,
+                );
                 Ok(Self {
-                    protocol, config, slots,
-                    streams: BTreeMap::new(), incoming: VecDeque::new(),
-                    wire: Vec::new(), transport_pending: Vec::new(),
-                    transport_offset: 0, transport_flushed: true, failed: None, draining: false, role: PhantomData,
+                    protocol,
+                    config,
+                    slots,
+                    streams: BTreeMap::new(),
+                    incoming: VecDeque::new(),
+                    wire: Vec::new(),
+                    transport_pending: Vec::new(),
+                    transport_offset: 0,
+                    transport_flushed: true,
+                    failure: None,
+                    phase: SessionPhase::Active,
+                    role: PhantomData,
                 })
             }
         }
@@ -205,23 +204,52 @@ macro_rules! constructor {
 }
 constructor!(Client, Client, EndpointRole::Client);
 constructor!(Server, Server, EndpointRole::Server);
-#[rustfmt::skip]
 impl GrpcClientSession {
     /// Starts a POST request; false END_STREAM enables incremental message sending.
     /// # Errors
     /// Rejects stream limits, invalid metadata/timeout or protocol submission failure.
-    pub fn start_request(&mut self, authority: &str, path: &str, metadata: &Metadata, timeout: Option<Timeout>, encoding: CompressionAlgorithm, end_stream: bool) -> Result<i32, Status> {
+    pub fn start_request(
+        &mut self,
+        authority: &str,
+        path: &str,
+        metadata: &Metadata,
+        timeout: Option<Timeout>,
+        encoding: CompressionAlgorithm,
+        end_stream: bool,
+    ) -> Result<i32, Status> {
         let content_type = self.config.content_type.clone();
-        self.start_request_with_content_type(authority, path, metadata, timeout, encoding, end_stream, &content_type)
+        self.start_request_with_content_type(
+            authority,
+            path,
+            metadata,
+            timeout,
+            encoding,
+            end_stream,
+            &content_type,
+        )
     }
     /// Starts a request with a codec media type independently of other RPCs.
     /// # Errors
     /// Rejects invalid media types, metadata, stream limits or protocol submission failure.
-    #[expect(clippy::too_many_arguments, reason = "The request carries routing, metadata, deadline, encoding and codec identity.")]
-    pub fn start_request_with_content_type(&mut self, authority: &str, path: &str, metadata: &Metadata, timeout: Option<Timeout>, encoding: CompressionAlgorithm, end_stream: bool, content_type: &str) -> Result<i32, Status> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The request carries routing, metadata, deadline, encoding and codec identity."
+    )]
+    pub fn start_request_with_content_type(
+        &mut self,
+        authority: &str,
+        path: &str,
+        metadata: &Metadata,
+        timeout: Option<Timeout>,
+        encoding: CompressionAlgorithm,
+        end_stream: bool,
+        content_type: &str,
+    ) -> Result<i32, Status> {
         validate_content_type(content_type)?;
         self.check_capacity()?;
-        if authority.is_empty() || !path.starts_with('/') { return Err(Status::invalid_argument("invalid RPC authority or path")); }
+        if authority.is_empty() || !path.starts_with('/') {
+            return Err(Status::invalid_argument("invalid RPC authority or path"));
+        }
         let mut headers = vec![
             (":method".into(), "POST".into()),
             (":scheme".into(), self.config.scheme.clone()),
@@ -236,17 +264,30 @@ impl GrpcClientSession {
             headers.push(("grpc-encoding".into(), encoding.as_str().into()));
         }
         if let Some(timeout) = timeout {
-            headers.push(("grpc-timeout".into(), format_grpc_timeout(timeout).map_err(internal)?));
+            headers.push((
+                "grpc-timeout".into(),
+                format_grpc_timeout(timeout).map_err(internal)?,
+            ));
         }
         validate_metadata(metadata)?;
         headers.extend(metadata.to_headers());
         self.check_headers(&headers)?;
         let queue = Rc::new(RefCell::new(Outbound::default()));
-        let provider = (!end_stream).then(|| DataProvider::new(Source { queue: Rc::clone(&queue), chunk: Vec::new() }));
-        let id = self.protocol.submit_request(&fields(&headers), provider).map_err(internal)?;
+        let provider = (!end_stream).then(|| {
+            DataProvider::new(Source {
+                queue: Rc::clone(&queue),
+                chunk: Vec::new(),
+            })
+        });
+        let id = self
+            .protocol
+            .submit_request(&fields(&headers), provider)
+            .map_err(internal)?;
         self.open(id, queue, encoding)?;
+        self.stream_mut(id)?.state.send_headers();
         if end_stream {
             self.slots.mark_local_end_stream(id).map_err(slot_error)?;
+            self.stream_mut(id)?.state.queue_end();
             self.stream_mut(id)?.outgoing.borrow_mut().eof = true;
         }
         Ok(id)
@@ -258,10 +299,10 @@ impl GrpcClientSession {
         self.check_send(id)?;
         self.stream_mut(id)?.outgoing.borrow_mut().eof = true;
         self.slots.mark_local_end_stream(id).map_err(slot_error)?;
+        self.stream_mut(id)?.state.queue_end();
         self.resume(id)
     }
 }
-#[rustfmt::skip]
 impl GrpcServerSession {
     /// Releases safely closed streams that were never handed to a request consumer.
     /// Dispatched streams retain their terminal state until explicitly removed.
@@ -273,7 +314,9 @@ impl GrpcServerSession {
             .streams
             .iter()
             .filter(|(id, stream)| {
-                !stream.dispatched && stream.closed && self.stream_outbound_complete(**id)
+                !stream.state.dispatched()
+                    && stream.state.closed()
+                    && self.stream_outbound_complete(**id)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -283,19 +326,50 @@ impl GrpcServerSession {
         Ok(closed.len())
     }
     /// Transfers the next received request's routing information.
-    pub fn pop_incoming_request(&mut self) -> Option<IncomingRequest> { let request = self.incoming.pop_front()?; if let Some(stream) = self.streams.get_mut(&request.stream_id) { stream.dispatched = true; } Some(request) }
+    pub fn pop_incoming_request(&mut self) -> Option<IncomingRequest> {
+        let request = self.incoming.pop_front()?;
+        if let Some(stream) = self.streams.get_mut(&request.stream_id) {
+            stream.state.dispatch();
+        }
+        Some(request)
+    }
     /// Sends response headers and installs an incremental body source.
     /// # Errors
     /// Rejects duplicate headers, ended streams and protocol submission failure.
-    pub fn send_initial_metadata(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm) -> Result<(), Status> { self.send_initial_metadata_with_content_type(id, metadata, encoding, &self.config.content_type.clone()) }
+    pub fn send_initial_metadata(
+        &mut self,
+        id: i32,
+        metadata: &Metadata,
+        encoding: CompressionAlgorithm,
+    ) -> Result<(), Status> {
+        self.send_initial_metadata_with_content_type(
+            id,
+            metadata,
+            encoding,
+            &self.config.content_type.clone(),
+        )
+    }
     /// Starts a response using the codec selected for this RPC's route.
     /// # Errors
     /// Rejects invalid media types, duplicate headers, ended streams or protocol failure.
-    pub fn send_initial_metadata_with_content_type(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm, content_type: &str) -> Result<(), Status> { self.begin_response(id, metadata, encoding, content_type) }
+    pub fn send_initial_metadata_with_content_type(
+        &mut self,
+        id: i32,
+        metadata: &Metadata,
+        encoding: CompressionAlgorithm,
+        content_type: &str,
+    ) -> Result<(), Status> {
+        self.begin_response(id, metadata, encoding, content_type)
+    }
     /// Completes a response, emitting trailers only when its queued DATA has drained.
     /// # Errors
     /// Rejects duplicate completion, invalid streams, budgets or protocol failure.
-    pub fn finish_response(&mut self, id: i32, status: &Status, metadata: &Metadata) -> Result<(), Status> {
+    pub fn finish_response(
+        &mut self,
+        id: i32,
+        status: &Status,
+        metadata: &Metadata,
+    ) -> Result<(), Status> {
         self.check_send(id)?;
         let mut headers = vec![("grpc-status".into(), status.code().as_i32().to_string())];
         if !status.message().is_empty() {
@@ -303,11 +377,13 @@ impl GrpcServerSession {
         }
         validate_metadata(metadata)?;
         headers.extend(metadata.to_headers());
-        if !self.stream_mut(id)?.sent_initial {
+        if !self.stream_mut(id)?.state.headers_sent() {
             headers.insert(0, ("content-type".into(), self.config.content_type.clone()));
             headers.insert(0, (":status".into(), "200".into()));
             self.check_headers(&headers)?;
-            self.protocol.submit_response(id, &fields(&headers), None).map_err(internal)?;
+            self.protocol
+                .submit_response(id, &fields(&headers), None)
+                .map_err(internal)?;
         } else {
             self.check_headers(&headers)?;
             let stream = self.stream_mut(id)?;
@@ -318,16 +394,30 @@ impl GrpcServerSession {
             drop(queue);
             self.resume(id)?;
         }
-        self.stream_mut(id)?.dispatched = true; self.slots.mark_local_end_stream(id).map_err(slot_error)
+        self.stream_mut(id)?.state.dispatch();
+        self.slots.mark_local_end_stream(id).map_err(slot_error)?;
+        self.stream_mut(id)?.state.queue_end();
+        Ok(())
     }
 }
-#[rustfmt::skip]
 impl<Role> GrpcSession<Role> {
-    fn begin_response(&mut self, id: i32, metadata: &Metadata, encoding: CompressionAlgorithm, content_type: &str) -> Result<(), Status> {
+    fn begin_response(
+        &mut self,
+        id: i32,
+        metadata: &Metadata,
+        encoding: CompressionAlgorithm,
+        content_type: &str,
+    ) -> Result<(), Status> {
         validate_content_type(content_type)?;
         self.check_send(id)?;
-        if self.stream_mut(id)?.sent_initial { return Err(Status::failed_precondition("response headers already sent")); }
-        let mut headers = vec![(":status".into(), "200".into()), ("content-type".into(), content_type.into()), ("grpc-accept-encoding".into(), ACCEPT.into())];
+        if self.stream_mut(id)?.state.headers_sent() {
+            return Err(Status::failed_precondition("response headers already sent"));
+        }
+        let mut headers = vec![
+            (":status".into(), "200".into()),
+            ("content-type".into(), content_type.into()),
+            ("grpc-accept-encoding".into(), ACCEPT.into()),
+        ];
         if encoding != CompressionAlgorithm::Identity {
             headers.push(("grpc-encoding".into(), encoding.as_str().into()));
         }
@@ -335,9 +425,19 @@ impl<Role> GrpcSession<Role> {
         headers.extend(metadata.to_headers());
         self.check_headers(&headers)?;
         let queue = Rc::clone(&self.stream_mut(id)?.outgoing);
-        self.protocol.submit_response(id, &fields(&headers), Some(DataProvider::new(Source { queue, chunk: Vec::new() }))).map_err(internal)?;
+        self.protocol
+            .submit_response(
+                id,
+                &fields(&headers),
+                Some(DataProvider::new(Source {
+                    queue,
+                    chunk: Vec::new(),
+                })),
+            )
+            .map_err(internal)?;
         let stream = self.stream_mut(id)?;
-        stream.sent_initial = true; stream.dispatched = true;
+        stream.state.send_headers();
+        stream.state.dispatch();
         stream.outgoing_encoding = encoding;
         Ok(())
     }
@@ -348,56 +448,128 @@ impl<Role> GrpcSession<Role> {
     pub fn submit_goaway(&mut self, error_code: u32) -> Result<(), Status> {
         self.check_live()?;
         let last = self.protocol.last_proc_stream_id();
-        self.protocol.submit_goaway(last, error_code, &[]).map_err(internal)?;
-        self.draining = true; Ok(())
+        self.protocol
+            .submit_goaway(last, error_code, &[])
+            .map_err(internal)?;
+        self.phase = SessionPhase::Draining;
+        Ok(())
     }
     /// Whether the protocol connection can accept additional inbound bytes.
-    pub fn want_read(&self) -> bool { self.failed.is_none() && self.protocol.want_read() }
+    pub fn want_read(&self) -> bool {
+        self.phase != SessionPhase::Failed && self.protocol.want_read()
+    }
     /// Whether protocol frames or partially written transport bytes need sending.
-    pub fn want_write(&self) -> bool { !self.transport_flushed || self.transport_offset < self.transport_pending.len() || self.streams.values().any(|s| s.pending_trailers.is_some() && s.outgoing.borrow().finished) || self.protocol.want_write() }
+    pub fn want_write(&self) -> bool {
+        !self.transport_flushed
+            || self.transport_offset < self.transport_pending.len()
+            || self
+                .streams
+                .values()
+                .any(|s| s.pending_trailers.is_some() && s.outgoing.borrow().finished)
+            || self.protocol.want_write()
+    }
     /// The most restrictive peer GOAWAY boundary and its HTTP/2 error code.
-    pub fn goaway_received(&self) -> Option<(i32, u32)> { self.slots.goaway() }
+    pub fn goaway_received(&self) -> Option<(i32, u32)> {
+        self.slots.goaway()
+    }
     /// Whether terminal output was serialized and tracked transport writes/flushes drained.
-    pub fn stream_outbound_complete(&self, id: i32) -> bool { self.transport_flushed && self.transport_offset == self.transport_pending.len() && self.streams.get(&id).is_some_and(|s| s.closed || s.end_stream_serialized) }
+    pub fn stream_outbound_complete(&self, id: i32) -> bool {
+        self.transport_flushed
+            && self.transport_offset == self.transport_pending.len()
+            && self
+                .streams
+                .get(&id)
+                .is_some_and(|s| s.state.outbound_phase() == OutboundPhase::Closed)
+    }
     /// Whether local or peer GOAWAY has stopped admission of new RPCs.
-    pub fn is_draining(&self) -> bool { self.draining || self.slots.goaway().is_some() }
-    fn client(&self) -> bool { self.protocol.role() == Http2Role::Client }
-    fn check_live(&self) -> Result<(), Status> { self.failed.clone().map_or(Ok(()), Err) }
+    pub fn is_draining(&self) -> bool {
+        self.phase == SessionPhase::Draining
+            || self.slots.goaway().is_some()
+            || self
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.phase == SessionPhase::Draining)
+    }
+    fn client(&self) -> bool {
+        self.protocol.role() == Http2Role::Client
+    }
     fn check_capacity(&self) -> Result<(), Status> {
         self.check_live()?;
-        if self.is_draining() { return Err(Status::unavailable("connection is draining")); }
-        if self.streams.len() >= self.config.max_active_streams { return Err(Status::resource_exhausted("active stream limit exceeded")); }
+        if self.is_draining() {
+            return Err(Status::unavailable("connection is draining"));
+        }
+        if self.streams.len() >= self.config.max_active_streams {
+            return Err(Status::resource_exhausted("active stream limit exceeded"));
+        }
         Ok(())
     }
     fn check_headers(&self, headers: &[(String, String)]) -> Result<(), Status> {
-        let bytes = headers.iter().try_fold(0usize, |n, (k, v)| n.checked_add(k.len() + v.len() + 32)).ok_or_else(resource)?;
-        if bytes > self.config.max_header_list_size as usize || bytes > self.config.per_stream_byte_budget { return Err(resource()); }
+        let bytes = headers
+            .iter()
+            .try_fold(0usize, |n, (k, v)| n.checked_add(k.len() + v.len() + 32))
+            .ok_or_else(resource)?;
+        if bytes > self.config.max_header_list_size as usize
+            || bytes > self.config.per_stream_byte_budget
+        {
+            return Err(resource());
+        }
         Ok(())
     }
-    fn stream_mut(&mut self, id: i32) -> Result<&mut Stream, Status> { self.streams.get_mut(&id).ok_or_else(|| Status::not_found("unknown stream")) }
-    fn open(&mut self, id: i32, queue: Rc<RefCell<Outbound>>, encoding: CompressionAlgorithm) -> Result<(), Status> {
+    fn stream_mut(&mut self, id: i32) -> Result<&mut Stream, Status> {
+        self.streams
+            .get_mut(&id)
+            .ok_or_else(|| Status::not_found("unknown stream"))
+    }
+    fn open(
+        &mut self,
+        id: i32,
+        queue: Rc<RefCell<Outbound>>,
+        encoding: CompressionAlgorithm,
+    ) -> Result<(), Status> {
         self.check_capacity()?;
         self.slots.open_stream(id).map_err(slot_error)?;
         self.streams.insert(
             id,
             Stream {
-                decoder: LengthPrefixedFrame::new(self.config.max_inbound_message_size.min(self.config.per_stream_byte_budget)),
+                decoder: LengthPrefixedFrame::new(
+                    self.config
+                        .max_inbound_message_size
+                        .min(self.config.per_stream_byte_budget),
+                ),
                 encoding: CompressionAlgorithm::Identity,
                 outgoing_encoding: encoding,
                 outgoing: queue,
-                headers: vec![], header_bytes: 0, initial: false, sent_initial: false, terminal: false, closed: false, end_stream_serialized: false, dispatched: false,
-                failure: None, failure_taken: false, http_status: 200, pending_trailers: None,
-                prefix: vec![], remaining: 0, reserved: 0,
+                headers: vec![],
+                header_bytes: 0,
+                state: StreamHsm::default(),
+                failure: None,
+                failure_taken: false,
+                http_status: 200,
+                pending_trailers: None,
+                prefix: [0; 5],
+                prefix_len: 0,
+                remaining: 0,
+                reserved: 0,
             },
         );
         Ok(())
     }
     fn check_send(&self, id: i32) -> Result<(), Status> {
         self.check_live()?;
-        let stream = self.streams.get(&id).ok_or_else(|| Status::not_found("unknown stream"))?;
-        if let Some(error) = &stream.failure { return Err(error.clone()); }
-        let slot = self.slots.get(id).ok_or_else(|| Status::not_found("unknown stream"))?;
-        if slot.local_end_stream() { return Err(Status::failed_precondition("sending half already closed")); }
+        let stream = self
+            .streams
+            .get(&id)
+            .ok_or_else(|| Status::not_found("unknown stream"))?;
+        if let Some(error) = &stream.failure {
+            return Err(error.clone());
+        }
+        let slot = self
+            .slots
+            .get(id)
+            .ok_or_else(|| Status::not_found("unknown stream"))?;
+        if slot.local_end_stream() {
+            return Err(Status::failed_precondition("sending half already closed"));
+        }
         Ok(())
     }
     fn resume(&mut self, id: i32) -> Result<(), Status> {
@@ -411,20 +583,49 @@ impl<Role> GrpcSession<Role> {
     /// Queues one framed message, preserving the stream's negotiated encoding.
     /// # Errors
     /// Rejects ended streams, mismatched encodings, compression failure or byte excess.
-    pub fn send_message(&mut self, id: i32, payload: &[u8], encoding: CompressionAlgorithm) -> Result<(), Status> {
+    pub fn send_message(
+        &mut self,
+        id: i32,
+        payload: &[u8],
+        encoding: CompressionAlgorithm,
+    ) -> Result<(), Status> {
         self.check_send(id)?;
-        if !self.client() && !self.stream_mut(id)?.sent_initial {
-            self.begin_response(id, &Metadata::new(), encoding, &self.config.content_type.clone())?;
+        if !self.client() && !self.stream_mut(id)?.state.headers_sent() {
+            self.begin_response(
+                id,
+                &Metadata::new(),
+                encoding,
+                &self.config.content_type.clone(),
+            )?;
         }
 
-        if encoding != CompressionAlgorithm::Identity && encoding != self.stream_mut(id)?.outgoing_encoding { return Err(Status::invalid_argument("message encoding differs from stream encoding")); }
-        if payload.len() > self.config.per_stream_byte_budget { return Err(resource()); }
-        let compressed = CompressionConfig { algorithm: encoding, ..self.config.compression }.compress(payload)?;
+        if encoding != CompressionAlgorithm::Identity
+            && encoding != self.stream_mut(id)?.outgoing_encoding
+        {
+            return Err(Status::invalid_argument(
+                "message encoding differs from stream encoding",
+            ));
+        }
+        if payload.len() > self.config.per_stream_byte_budget {
+            return Err(resource());
+        }
+        let compressed = CompressionConfig {
+            algorithm: encoding,
+            ..self.config.compression
+        }
+        .compress(payload)?;
         let frame = AlignedMessageBuf::new(&compressed.data, compressed.compressed)?;
         let budget = self.config.per_stream_byte_budget;
         let stream = self.stream_mut(id)?;
         let mut queue = stream.outgoing.borrow_mut();
-        if queue.bytes.len().checked_add(frame.wire_bytes().len()).is_none_or(|n| n > budget) { return Err(resource()); }
+        if queue
+            .bytes
+            .len()
+            .checked_add(frame.wire_bytes().len())
+            .is_none_or(|n| n > budget)
+        {
+            return Err(resource());
+        }
         queue.bytes.extend(frame.wire_bytes());
         drop(queue);
         self.resume(id)
@@ -435,17 +636,28 @@ impl<Role> GrpcSession<Role> {
     /// Rejects unknown streams or protocol reset submission failure.
     pub fn cancel_stream(&mut self, id: i32, error_code: u32) -> Result<(), Status> {
         self.check_read(id)?;
-        if error_code == 0 && self.streams.get(&id).is_some_and(|s| s.closed && s.terminal) { return Ok(()); }
-        self.protocol.submit_rst_stream(id, error_code).map_err(internal)?;
+        if error_code == 0
+            && self
+                .streams
+                .get(&id)
+                .is_some_and(|s| s.state.closed() && s.state.terminal())
+        {
+            return Ok(());
+        }
+        self.protocol
+            .submit_rst_stream(id, error_code)
+            .map_err(internal)?;
         self.fail_stream(id, Status::cancelled("stream cancelled"), error_code)
     }
     fn fail_stream(&mut self, id: i32, error: Status, code: u32) -> Result<(), Status> {
         let stream = self.stream_mut(id)?;
-        if stream.failure.is_some() { return Ok(()); }
+        if stream.failure.is_some() {
+            return Ok(());
+        }
         stream.failure = Some(error);
         stream.decoder.reset();
         stream.reserved = 0;
-        stream.prefix.clear();
+        stream.prefix_len = 0;
         stream.headers.clear();
         stream.pending_trailers = None;
         stream.outgoing.borrow_mut().bytes.clear();
@@ -472,7 +684,11 @@ impl<Role> GrpcSession<Role> {
     /// # Errors
     /// Returns protocol connection or callback-processing errors.
     pub fn mem_send(&mut self) -> Result<&[u8], Status> {
-        if self.transport_offset < self.transport_pending.len() { return Err(Status::failed_precondition("transport output must drain before mem_send")); }
+        if self.transport_offset < self.transport_pending.len() {
+            return Err(Status::failed_precondition(
+                "transport output must drain before mem_send",
+            ));
+        }
         self.check_live()?;
         self.submit_ready_trailers()?;
         self.wire = self.protocol.mem_send().map_err(internal)?.to_vec();
@@ -485,10 +701,17 @@ impl<Role> GrpcSession<Role> {
         Ok(&self.wire)
     }
     fn submit_ready_trailers(&mut self) -> Result<(), Status> {
-        let ready: Vec<_> = self.streams.iter().filter(|(_, s)| s.pending_trailers.is_some() && s.outgoing.borrow().finished).map(|(id, _)| *id).collect();
+        let ready: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.pending_trailers.is_some() && s.outgoing.borrow().finished)
+            .map(|(id, _)| *id)
+            .collect();
         for id in ready {
             if let Some(headers) = self.stream_mut(id)?.pending_trailers.take() {
-                self.protocol.submit_trailer(id, &fields(&headers)).map_err(internal)?;
+                self.protocol
+                    .submit_trailer(id, &fields(&headers))
+                    .map_err(internal)?;
             }
         }
         Ok(())
@@ -496,12 +719,17 @@ impl<Role> GrpcSession<Role> {
     /// Flushes wire output, retaining partially written chunks across WouldBlock.
     /// # Errors
     /// Returns transport or session failures; WouldBlock means retry later.
-    pub fn flush_to_transport<T: SyncTransport>(&mut self, transport: &mut T) -> Result<(), Status> {
+    pub fn flush_to_transport<T: SyncTransport>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), Status> {
         loop {
             if self.transport_offset == self.transport_pending.len() {
                 self.transport_pending = self.mem_send()?.to_vec();
                 self.transport_offset = 0;
-                if !self.transport_pending.is_empty() { self.transport_flushed = false; }
+                if !self.transport_pending.is_empty() {
+                    self.transport_flushed = false;
+                }
                 if self.transport_pending.is_empty() {
                     break;
                 }
@@ -515,16 +743,28 @@ impl<Role> GrpcSession<Role> {
             }
         }
         match transport.flush() {
-            Ok(()) => { self.transport_flushed = true; Ok(()) },
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { self.transport_flushed = false; Ok(()) },
+            Ok(()) => {
+                self.transport_flushed = true;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.transport_flushed = false;
+                Ok(())
+            }
             Err(e) => Err(Status::unavailable(e.to_string())),
         }
     }
     /// Flushes outgoing data, reads once and routes inbound bytes.
     /// # Errors
     /// Returns transport EOF/errors or session errors. WouldBlock returns zero.
-    pub fn step_transport<T: SyncTransport>(&mut self, transport: &mut T, buf: &mut [u8]) -> Result<usize, Status> {
-        if buf.is_empty() { return Err(Status::invalid_argument("receive buffer is empty")); }
+    pub fn step_transport<T: SyncTransport>(
+        &mut self,
+        transport: &mut T,
+        buf: &mut [u8],
+    ) -> Result<usize, Status> {
+        if buf.is_empty() {
+            return Err(Status::invalid_argument("receive buffer is empty"));
+        }
         self.flush_to_transport(transport)?;
         let n = loop {
             match transport.read(buf) {
@@ -538,67 +778,12 @@ impl<Role> GrpcSession<Role> {
         let mut used = 0;
         while used < n {
             let count = self.mem_recv(&buf[used..n])?;
-            if count == 0 { return Err(Status::internal("HTTP/2 receive made no progress")); }
+            if count == 0 {
+                return Err(Status::internal("HTTP/2 receive made no progress"));
+            }
             used += count;
         }
         self.flush_to_transport(transport)?;
         Ok(n)
-    }
-    /// Transfers custom initial metadata, preserving stream lifecycle history.
-    /// # Errors
-    /// Returns unknown/reset stream or metadata decoding errors.
-    pub fn pop_initial_metadata(&mut self, id: i32) -> Result<Option<Metadata>, Status> {
-        self.check_read(id)?;
-        self.slots.pop_initial_metadata(id).map_err(slot_error)?.map(|h| metadata(&h)).transpose()
-    }
-    /// Transfers one decompressed message into eight-byte-aligned storage.
-    /// # Errors
-    /// Returns unknown/reset stream or allocation errors.
-    pub fn pop_message(&mut self, id: i32) -> Result<Option<AlignedMessageBuf>, Status> {
-        self.check_read(id)?;
-        self.slots.pop_message(id).map_err(slot_error)?.map(|m| AlignedMessageBuf::new(&m.payload, false)).transpose()
-    }
-    /// Whether the peer's request or response half has ended.
-    /// # Errors
-    /// Returns unknown/reset stream errors.
-    pub fn is_remote_end_stream(&self, id: i32) -> Result<bool, Status> {
-        self.check_read(id)?;
-        Ok(self.slots.get(id).is_some_and(|s| s.remote_end_stream()))
-    }
-    fn check_read(&self, id: i32) -> Result<(), Status> {
-        let s = self.streams.get(&id).ok_or_else(|| Status::not_found("unknown stream"))?;
-        s.failure.clone().map_or(Ok(()), Err)
-    }
-    /// Takes terminal status and custom trailing metadata exactly once.
-    /// # Errors
-    /// Returns unknown/reset stream or invalid metadata errors.
-    pub fn take_trailers(&mut self, id: i32) -> Result<Option<(Status, Metadata)>, Status> {
-        if let Some(error) = self.stream_mut(id)?.failure.clone() {
-            if self.stream_mut(id)?.failure_taken { return Ok(None); }
-            self.stream_mut(id)?.failure_taken = true;
-            return Ok(Some((error, Metadata::new())));
-        }
-        self.slots
-            .take_trailers(id)
-            .map_err(slot_error)?
-            .map(|h| {
-                let code = value(&h, "grpc-status")?.and_then(|v| v.parse::<i32>().ok()).map_or(Code::Unknown, Code::from_i32);
-                let message = decode_grpc_message(value(&h, "grpc-message")?.unwrap_or(""));
-                Ok((Status::new(code, message), metadata(&h)?))
-            })
-            .transpose()
-    }
-    /// Releases a closed stream and all unread events.
-    /// # Errors
-    /// Rejects unknown or still-open streams.
-    pub fn remove_closed_stream(&mut self, id: i32) -> Result<(), Status> {
-        if !self.stream_mut(id)?.closed { return Err(Status::failed_precondition("protocol stream is not closed")); }
-        if self.slots.get(id).is_some() {
-            self.slots.remove_closed_stream(id).map_err(slot_error)?;
-        }
-        self.protocol.release_stream(id).map_err(internal)?;
-        self.streams.remove(&id);
-        self.incoming.retain(|r| r.stream_id != id);
-        Ok(())
     }
 }

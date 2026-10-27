@@ -214,12 +214,16 @@ fn validate_key(key: &str) -> Result<(), MetadataError> {
 /// Rejects missing/unsupported units, whitespace, signs or more than eight digits.
 pub fn parse_grpc_timeout(value: &str) -> Result<Duration, MetadataError> {
     let bytes = value.as_bytes();
-    if !(2..=9).contains(&bytes.len()) || !bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit) {
+    if !(2..=9).contains(&bytes.len()) {
         return Err(MetadataError::InvalidTimeout);
     }
     let mut count = 0_u64;
     for byte in &bytes[..bytes.len() - 1] {
-        count = count * 10 + u64::from(*byte - b'0');
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return Err(MetadataError::InvalidTimeout);
+        }
+        count = count * 10 + u64::from(digit);
     }
     Ok(match bytes[bytes.len() - 1] {
         b'H' => Duration::from_secs(count * 3600),
@@ -247,7 +251,21 @@ pub fn format_grpc_timeout(timeout: Duration) -> Result<String, MetadataError> {
     ] {
         let count = timeout.as_nanos().div_ceil(nanos);
         if count <= 99_999_999 {
-            return Ok(format!("{count}{unit}"));
+            let mut buffer = [0_u8; 9];
+            buffer[8] = unit as u8;
+            let mut cursor = 8;
+            let mut count = count as u32;
+            loop {
+                cursor -= 1;
+                buffer[cursor] = b'0' + (count % 10) as u8;
+                count /= 10;
+                if count == 0 {
+                    break;
+                }
+            }
+            let mut result = String::with_capacity(9 - cursor);
+            result.extend(buffer[cursor..].iter().copied().map(char::from));
+            return Ok(result);
         }
     }
     Err(MetadataError::InvalidTimeout)

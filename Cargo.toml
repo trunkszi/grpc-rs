@@ -17,6 +17,7 @@ license = "Apache-2.0"
 repository = "https://github.com/trunkszi/grpc-rs"
 
 [workspace.dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 liburing = { version = "0.0.1", package = "liburing-proactor" }
 libc = { version = "0.2" }
 thiserror = { version = "2.0" }

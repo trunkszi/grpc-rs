@@ -35,6 +35,7 @@ anyhow = { workspace = true }
 grpc-build = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 anyhow = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }

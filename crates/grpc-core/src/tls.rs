@@ -113,11 +113,29 @@ pub struct TlsTransport<C, T: SyncTransport> {
     write_closed: bool,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsSuperstate {
+    Handshaking,
+    Established,
+    Failed,
+}
+#[repr(u8)]
 #[derive(Clone, Copy)]
 enum HandshakeState {
     Negotiating,
+    DrainingFinalOutput,
     Ready,
     Failed(io::ErrorKind),
+}
+impl HandshakeState {
+    fn superstate(self) -> TlsSuperstate {
+        match self {
+            Self::Negotiating | Self::DrainingFinalOutput => TlsSuperstate::Handshaking,
+            Self::Ready => TlsSuperstate::Established,
+            Self::Failed(_) => TlsSuperstate::Failed,
+        }
+    }
 }
 
 impl<T: SyncTransport> TlsTransport<rustls::ClientConnection, T> {
@@ -213,12 +231,15 @@ macro_rules! impl_tls_transport {
             /// Custom transports must support timeout queries for Some(deadline).
             /// A timeout restoration failure permanently disables application I/O.
             pub fn handshake_until(&mut self, deadline: Option<Instant>) -> io::Result<()> {
-                match self.state {
-                    HandshakeState::Ready => return Ok(()),
-                    HandshakeState::Failed(kind) => {
+                match self.state.superstate() {
+                    TlsSuperstate::Established => return Ok(()),
+                    TlsSuperstate::Failed => {
+                        let HandshakeState::Failed(kind) = self.state else {
+                            unreachable!("failed TLS retains its reason")
+                        };
                         return Err(io::Error::new(kind, "TLS handshake previously failed"));
                     }
-                    HandshakeState::Negotiating => {}
+                    TlsSuperstate::Handshaking => {}
                 }
                 let result = if deadline.is_some() {
                     remaining_handshake_time(deadline)?;
@@ -288,6 +309,7 @@ macro_rules! impl_tls_transport {
                 // Client Finished must reach the peer. Server session tickets can
                 // wait for application I/O without delaying handshake readiness.
                 if $drain_final_output {
+                    self.state = HandshakeState::DrainingFinalOutput;
                     self.drain_handshake_output(deadline)?;
                 }
                 Ok(())
@@ -306,14 +328,14 @@ macro_rules! impl_tls_transport {
 
             /// Returns ALPN only after successful HTTP/2 negotiation.
             pub fn negotiated_alpn(&self) -> Option<&[u8]> {
-                matches!(self.state, HandshakeState::Ready)
+                (self.state.superstate() == TlsSuperstate::Established)
                     .then(|| self.stream.conn.alpn_protocol())
                     .flatten()
             }
 
             /// Returns the TLS version only after successful HTTP/2 negotiation.
             pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
-                matches!(self.state, HandshakeState::Ready)
+                (self.state.superstate() == TlsSuperstate::Established)
                     .then(|| self.stream.conn.protocol_version())
                     .flatten()
             }

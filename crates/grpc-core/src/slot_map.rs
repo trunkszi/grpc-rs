@@ -1,9 +1,10 @@
 //! Bounded, single-threaded ownership of HTTP/2 stream receive events.
 //!
 //! Budgets count metadata, message descriptors and wire bytes, excluding allocator overhead.
-//! Normalized buffers and shrinking queues bound spare capacity. Rejections preserve accepted data.
+//! Normalized payloads and bounded reusable queues limit spare capacity. Rejections preserve
+//! accepted data.
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     mem::size_of,
 };
 
@@ -216,11 +217,13 @@ impl StreamSlotMap {
                 error_code,
             });
         }
-        if self.slots.contains_key(&stream_id) {
-            return Err(SlotMapError::AlreadyOpen(stream_id));
+        match self.slots.entry(stream_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(StreamSlot::default());
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SlotMapError::AlreadyOpen(stream_id)),
         }
-        self.slots.insert(stream_id, StreamSlot::default());
-        Ok(())
     }
     /// Looks up a stream without consuming events.
     #[must_use]
@@ -486,9 +489,7 @@ impl StreamSlotMap {
         let slot = self.slot_mut(stream_id)?;
         slot.check_reset(stream_id)?;
         let message = slot.messages.pop_front();
-        if slot.messages.len() <= slot.messages.capacity() / 4 {
-            slot.messages.shrink_to_fit();
-        }
+        // Retain the bounded descriptor capacity for reuse until stream removal.
         if let Some(message) = &message {
             slot.buffered_bytes -= message.payload.len() + 5 + size_of::<StreamMessage>();
         }
