@@ -27,6 +27,12 @@ fn io_error(error: UringError) -> io::Error {
         | UringError::Submit(errno)
         | UringError::Wait(errno)
         | UringError::Syscall { errno, .. } => io::Error::from_raw_os_error(errno),
+        UringError::SqThreadGone => io::Error::new(io::ErrorKind::BrokenPipe, error),
+        UringError::OpcodeNotAdmitted { .. }
+        | UringError::BlockingWaitUnavailable { .. }
+        | UringError::CancellationUnavailable { .. } => {
+            io::Error::new(io::ErrorKind::Unsupported, error)
+        }
         _ => io::Error::other(error),
     }
 }
@@ -372,6 +378,38 @@ fn bounded_accept(driver: &mut Driver, listener: RawFd) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_errors_map_io_kinds() {
+        assert_eq!(
+            io_error(UringError::SqThreadGone).kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            io_error(UringError::OpcodeNotAdmitted {
+                opcode: 0,
+                mode: "iopoll",
+            })
+            .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            io_error(UringError::BlockingWaitUnavailable { mode: "sqpoll" }).kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            io_error(UringError::CancellationUnavailable { mode: "sqpoll" }).kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            io_error(UringError::RingInit(libc::EINVAL)).raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            io_error(UringError::CompletionsDropped).kind(),
+            io::ErrorKind::Other
+        );
+    }
 
     #[test]
     fn integration_scenario_legacy_immediate_accept_cancels_and_reuses_ring() -> io::Result<()> {
