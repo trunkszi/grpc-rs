@@ -567,9 +567,8 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "liburing-proactor"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135ca94fe93bd1b997ae72520afdfd6079410b870ce71c499e76099cbb9a28b"
+version = "0.0.2"
+source = "git+https://github.com/trunkszi/liburing-rs.git?branch=main#69e1c5a25e404f37f467333a6578b5034f1d3ee6"
 dependencies = [
  "io-uring",
  "libc",
@@ -622,8 +621,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 [[package]]
 name = "nexora-proto"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f61efa322789e5d57fb5b05765aae2a086c889a1a0f093c6075f41fd589c278d"
+source = "git+https://github.com/trunkszi/nexora-rs.git?branch=main#1813fd3256f6c6b91ce1de849c003eb90b449cd9"
 dependencies = [
  "base64",
  "rcgen",

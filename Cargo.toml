@@ -18,7 +18,7 @@ repository = "https://github.com/trunkszi/grpc-rs"
 
 [workspace.dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
-liburing = { version = "0.0.1", package = "liburing-proactor" }
+liburing = { git = "https://github.com/trunkszi/liburing-rs.git", branch = "main", package = "liburing-proactor" }
 libc = { version = "0.2" }
 thiserror = { version = "2.0" }
 anyhow = { version = "1.0" }
@@ -38,7 +38,7 @@ grpc-codec-prost = { version = "0.0.1", path = "crates/grpc-codec/prost" }
 grpc-codec-fory = { version = "0.0.1", path = "crates/grpc-codec/fory" }
 grpc-codec-capnp = { version = "0.0.1", path = "crates/grpc-codec/capnp" }
 grpc-macros = { version = "0.0.1", path = "crates/grpc-macros" }
-nexora-proto = { version = "0.0.1" }
+nexora-proto = { git = "https://github.com/trunkszi/nexora-rs.git", branch = "main" }
 socket2 = { version = "0.6", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
