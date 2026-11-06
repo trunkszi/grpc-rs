@@ -1,0 +1,29 @@
+[package]
+name = "grpc-rs-build"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+readme = "../../README.md"
+description = "Schema compiler and code generator for grpc-rs (Protobuf, Apache Fory, Cap'n Proto)"
+
+[lib]
+name = "grpc_build"
+
+[lints]
+workspace = true
+
+[features]
+default = ["protobuf", "capnp"]
+protobuf = ["dep:prost-build"]
+capnp = ["dep:capnpc"]
+
+[dependencies]
+thiserror = { workspace = true }
+prost-build = { workspace = true, optional = true }
+capnpc = { workspace = true, optional = true }
+
+[dev-dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

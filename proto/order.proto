@@ -1,0 +1,16 @@
+syntax = "proto3";
+package order;
+
+// Integer lots and ticks avoid rounding order quantities and limit prices.
+message OrderRequest { uint64 client_order_id = 1; uint64 instrument_id = 2; uint64 quantity = 3; int64 price_ticks = 4; }
+message OrderAck { uint64 client_order_id = 1; bool accepted = 2; uint64 quantity = 3; }
+message DepthRequest { uint64 instrument_id = 1; uint32 levels = 2; }
+message DepthLevel { int64 price_ticks = 1; uint64 quantity = 2; uint32 level = 3; }
+message FillReport { uint64 client_order_id = 1; uint64 quantity = 2; }
+message FillSummary { uint64 total_quantity = 1; uint32 fill_count = 2; }
+service OrderService {
+  rpc PlaceOrder(OrderRequest) returns (OrderAck);
+  rpc SubscribeDepth(DepthRequest) returns (stream DepthLevel);
+  rpc UploadFills(stream FillReport) returns (FillSummary);
+  rpc OrderStream(stream OrderRequest) returns (stream OrderAck);
+}

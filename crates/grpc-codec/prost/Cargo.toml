@@ -1,0 +1,17 @@
+[package]
+name = "grpc-codec-prost"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+readme = "../../../README.md"
+description = "Protobuf (prost) codec for grpc-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+uarch = { workspace = true }
+thiserror = { workspace = true }
+grpc-core = { workspace = true }
+prost = { workspace = true }
